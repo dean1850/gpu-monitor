@@ -1,0 +1,4 @@
+fastapi
+uvicorn[standard]
+websockets
+aiodocker>=0.22

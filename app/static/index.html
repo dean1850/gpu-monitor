@@ -1,0 +1,978 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: MIT -->
+<!-- Copyright (c) 2026 gpu-monitor contributors -->
+<!--
+  GPU Monitor — multi-vendor dashboard.
+
+  FIX-P11-HTML-1: REBUILT.  The layout follows GNOME System Monitor's
+  Resources tab, which is what was asked for: a stack of titled sections,
+  each a rolling line chart with the percentage axis on the RIGHT, a time
+  axis counting DOWN to "0" at the right edge, and a legend beneath carrying
+  a colour swatch, a name, and the current value.
+
+  Dark mode only, using the Adwaita dark palette — the same design language
+  the reference screenshot comes from, rather than a generic dark theme.
+
+  FIX-P11-HTML-2: everything is keyed on GPU uid.  Sections, chart datasets,
+  history replay and container rows are all built per GPU, so one, two or
+  five GPUs of mixed vendors render identically without special cases.
+-->
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPU Monitor</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%231c1c1c'/%3E%3Crect x='3' y='3' width='10' height='10' rx='2' fill='none' stroke='%2333d17a' stroke-width='1.5'/%3E%3Crect x='6' y='6' width='4' height='4' fill='%2333d17a'/%3E%3C/svg%3E">
+<style>
+/* ── Adwaita dark tokens ────────────────────────────────────────────── */
+:root {
+  --bg:            #1c1c1c;
+  --surface:       #242424;
+  --surface-hi:    #2c2c2c;
+  --border:        #3a3a3a;
+  --border-soft:   #303030;
+  --grid:          #343434;
+  --text:          #ffffff;
+  --text-dim:      #9a9996;
+  --text-faint:    #6e6d6b;
+
+  --accent:        #3584e4;
+  --warn:          #e5a50a;
+  --error:         #e01b24;
+  --ok:            #33d17a;
+
+  --radius:        10px;
+  --radius-sm:     6px;
+
+  --font-ui: "Inter", "Cantarell", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", "Cascadia Mono", monospace;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── App header ─────────────────────────────────────────────────────── */
+.appbar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+  padding: 0.85rem 1.25rem;
+  background: rgba(28, 28, 28, 0.92);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--border);
+}
+.appbar h1 {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+.appbar .spacer { flex: 1; }
+
+.meta {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+.meta strong { color: var(--text); font-weight: 600; }
+
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}
+.dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  transition: background 0.2s ease;
+}
+.dot.live      { background: var(--ok); box-shadow: 0 0 0 3px rgba(51, 209, 122, 0.15); }
+.dot.connecting{ background: var(--warn); }
+.dot.down      { background: var(--error); }
+
+/* ── Layout ─────────────────────────────────────────────────────────── */
+main {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 1.25rem 1.25rem 3rem;
+}
+
+.banner {
+  border-radius: var(--radius-sm);
+  padding: 0.7rem 0.9rem;
+  margin-bottom: 1rem;
+  font-size: 0.8rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  border: 1px solid transparent;
+}
+.banner.error { background: rgba(224, 27, 36, 0.12);  border-color: rgba(224, 27, 36, 0.4);  color: #ff9c9c; }
+.banner.warn  { background: rgba(229, 165, 10, 0.12); border-color: rgba(229, 165, 10, 0.4); color: #ffd684; }
+.banner[hidden] { display: none; }
+
+/* ── GPU card ───────────────────────────────────────────────────────── */
+.gpu {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-bottom: 1.1rem;
+  overflow: hidden;
+}
+
+.gpu-head {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  padding: 0.8rem 1rem;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--surface-hi);
+}
+.gpu-head h2 {
+  margin: 0;
+  font-size: 0.9rem;
+  font-weight: 650;
+  letter-spacing: 0.005em;
+}
+.gpu-head .spacer { flex: 1; }
+
+.badge {
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  padding: 0.16rem 0.44rem;
+  border-radius: 4px;
+  border: 1px solid currentColor;
+}
+.badge.intel  { color: #6fb3ff; }
+.badge.amd    { color: #ff7b6b; }
+.badge.nvidia { color: #78d96f; }
+
+.gpu-sub {
+  font-size: 0.72rem;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+}
+
+.section {
+  padding: 0.9rem 1rem 1rem;
+  border-bottom: 1px solid var(--border-soft);
+}
+.section:last-child { border-bottom: none; }
+.section > h3 {
+  margin: 0 0 0.7rem;
+  font-size: 0.82rem;
+  font-weight: 650;
+  color: var(--text);
+}
+
+/* ── Chart frame ────────────────────────────────────────────────────── */
+/* The plot sits in a bordered box; the % axis is drawn by Chart.js on the
+   right, matching System Monitor. The canvas height is fixed so the axis
+   gridlines line up across every GPU section on the page. */
+.plot {
+  position: relative;
+  height: 132px;
+}
+.plot canvas { display: block; width: 100% !important; height: 100% !important; }
+
+/* ── Legend ─────────────────────────────────────────────────────────── */
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 1.4rem;
+  margin-top: 0.7rem;
+}
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.78rem;
+  color: var(--text-dim);
+}
+.legend-item .swatch {
+  width: 14px;
+  height: 10px;
+  border-radius: 2px;
+  flex: none;
+}
+.legend-item .label { color: var(--text); }
+.legend-item .value {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+}
+.legend-item.off { opacity: 0.45; }
+
+/* ── Stat strip ─────────────────────────────────────────────────────── */
+.stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.75rem;
+  margin-top: 0.75rem;
+  padding-top: 0.7rem;
+  border-top: 1px dashed var(--border-soft);
+}
+.stat { display: flex; flex-direction: column; gap: 0.1rem; }
+.stat .k {
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--text-faint);
+}
+.stat .v {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+.stat .v.na { color: var(--text-faint); }
+
+/* ── Container bars ─────────────────────────────────────────────────── */
+.bars { display: flex; flex-direction: column; gap: 0.4rem; }
+.bar-row {
+  display: grid;
+  grid-template-columns: minmax(90px, 170px) 1fr 56px;
+  align-items: center;
+  gap: 0.7rem;
+  font-size: 0.78rem;
+}
+.bar-row.idle { opacity: 0.48; }
+.bar-name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text);
+}
+.bar-track {
+  height: 9px;
+  background: #191919;
+  border-radius: 5px;
+  overflow: hidden;
+}
+.bar-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 5px;
+  transition: width 0.45s cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+.bar-val {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  color: var(--text-dim);
+}
+
+.empty {
+  font-size: 0.78rem;
+  color: var(--text-faint);
+  padding: 0.5rem 0;
+}
+
+/* ── Empty / no-GPU state ───────────────────────────────────────────── */
+.blank {
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  padding: 2.5rem 1.5rem;
+  text-align: center;
+  color: var(--text-dim);
+}
+.blank h2 { margin: 0 0 0.5rem; font-size: 1rem; color: var(--text); }
+.blank p  { margin: 0.35rem 0; font-size: 0.82rem; }
+.blank code {
+  font-family: var(--font-mono);
+  background: var(--surface-hi);
+  padding: 0.1rem 0.32rem;
+  border-radius: 4px;
+  font-size: 0.78rem;
+}
+
+/* ── Responsive ─────────────────────────────────────────────────────── */
+@media (max-width: 640px) {
+  main { padding: 0.9rem 0.7rem 2rem; }
+  .appbar { flex-wrap: wrap; gap: 0.5rem 0.8rem; padding: 0.7rem 0.85rem; }
+  .appbar .spacer { display: none; }
+  .plot { height: 112px; }
+  .legend { gap: 0.3rem 1rem; }
+  .bar-row { grid-template-columns: minmax(70px, 110px) 1fr 48px; }
+  .gpu-sub { display: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}
+
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+</style>
+</head>
+<body>
+
+<header class="appbar">
+  <h1>GPU Monitor</h1>
+  <span class="status"><span class="dot connecting" id="dot"></span><span id="conn">Connecting…</span></span>
+  <span class="spacer"></span>
+  <span class="meta" id="meta"></span>
+</header>
+
+<main>
+  <div class="banner error" id="banner" hidden></div>
+  <div id="gpus"></div>
+  <div class="blank" id="blank" hidden>
+    <h2>No GPUs are being monitored</h2>
+    <p>Every enabled backend probed and found nothing.</p>
+    <p>Check that <code>/dev/dri</code> is passed through, and review the
+       <code>GPU_ENABLE_*</code> switches in your <code>.env</code> file.</p>
+    <p>Setting a vendor to <code>true</code> rather than <code>auto</code>
+       makes that backend report exactly why it found nothing.</p>
+    <p>Open <code>/health</code> for the per-vendor reason.</p>
+  </div>
+</main>
+
+<script src="chart.umd.min.js"></script>
+<script>
+'use strict';
+
+/* ═══════════════════════════════════════════════════════════════════════
+   Palette — GNOME's own accent colours, so the chart reads like the tool
+   it's modelled on rather than a generic dashboard theme.
+   ═══════════════════════════════════════════════════════════════════════ */
+const ENGINE_COLORS = ['#ff7800', '#e01b24', '#33d17a', '#3584e4', '#c061cb', '#f6d32d'];
+const SECONDARY_COLORS = ['#2190a4', '#c061cb', '#f6d32d', '#986a44'];
+const BAR_PALETTE = ['#3584e4', '#33d17a', '#ff7800', '#c061cb', '#f6d32d',
+                     '#2190a4', '#e01b24', '#986a44', '#8ff0a4', '#dc8add'];
+const HOST_COLOR = '#77767b';
+
+const CHART_LINE_WIDTH = 1.6;
+
+let WINDOW_S = 60;          /* overwritten by server config */
+let SAMPLE_INTERVAL_S = 1;
+
+const state = {
+  cards: new Map(),         /* uid -> card object */
+  devices: [],
+  order: [],
+  /* FIX-P10-HTML-1: an explicit "have we built yet" flag, because `order`
+     alone cannot distinguish "not built" from "built, zero GPUs" — both
+     join() to the empty string. See ensureCards(). */
+  built: false,
+  chartsOk: true
+};
+
+/* ── helpers ─────────────────────────────────────────────────────────── */
+
+const $ = (id) => document.getElementById(id);
+
+function hashString(str) {
+  let h = 0;
+  for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) >>> 0;
+  return h;
+}
+
+function barColor(name) {
+  if (name === 'host') return HOST_COLOR;
+  return BAR_PALETTE[hashString(name) % BAR_PALETTE.length];
+}
+
+function fmtPct(v) {
+  return (v === null || v === undefined || Number.isNaN(v)) ? '—' : `${v.toFixed(1)}%`;
+}
+
+function el(tag, cls, text) {
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   Chart construction
+
+   The axis arrangement is the distinctive part of the System Monitor look
+   and is reproduced deliberately:
+     • y axis on the RIGHT, ticks at 0 / 50 / 100 only
+     • x axis counting DOWN, so "now" is the right edge and the leftmost
+       tick is labelled "<window> seconds"
+     • no legend box — the legend lives in the DOM below, where it can
+       carry live values
+   ═══════════════════════════════════════════════════════════════════════ */
+
+function makeChart(canvas, seriesNames, colors) {
+  /* FIX-P11-HTML-3: N+1 points, not N. A 60 s window sampled at 1 Hz spans
+     ages 60…0 inclusive, which is 61 slots. With only 60 the oldest label
+     was 59, and since the tick callback labels multiples of ten, the
+     leftmost "60 seconds" marker never rendered at all. */
+  const points = Math.max(2, Math.round(WINDOW_S / SAMPLE_INTERVAL_S) + 1);
+  const labels = Array.from({ length: points }, (_, i) =>
+    Math.round((points - 1 - i) * SAMPLE_INTERVAL_S));
+
+  const datasets = seriesNames.map((name, i) => ({
+    label: name,
+    data: new Array(points).fill(null),
+    borderColor: colors[i % colors.length],
+    backgroundColor: colors[i % colors.length],
+    borderWidth: CHART_LINE_WIDTH,
+    pointRadius: 0,
+    pointHitRadius: 0,
+    tension: 0.32,
+    spanGaps: false,
+    fill: false
+  }));
+
+  return new Chart(canvas.getContext('2d'), {
+    type: 'line',
+    data: { labels, datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,
+      interaction: { mode: 'nearest', intersect: false },
+      layout: { padding: { top: 4, right: 2, bottom: 0, left: 2 } },
+      plugins: { legend: { display: false }, tooltip: { enabled: false } },
+      scales: {
+        x: {
+          grid: {
+            color: 'rgba(255,255,255,0.045)',
+            drawTicks: false,
+            drawBorder: false
+          },
+          border: { display: false },
+          ticks: {
+            color: '#6e6d6b',
+            font: { size: 10, family: 'JetBrains Mono, ui-monospace, monospace' },
+            maxRotation: 0,
+            autoSkip: false,
+            /* Label only every 10 s; annotate the leftmost with its unit,
+               exactly as System Monitor does. */
+            callback: function (value, index) {
+              const secs = this.getLabelForValue(value);
+              if (secs % 10 !== 0) return '';
+              /* FIX-P11-HTML-4: at sub-second sampling, several adjacent
+                 slots round to the same whole second, which drew each tick
+                 twice ("60 | 60 | 50 | 50"). Label only the first slot
+                 carrying a given second. */
+              if (index > 0 && this.getLabelForValue(index - 1) === secs) return '';
+              if (index === 0) return `${secs} seconds`;
+              return `${secs}`;
+            }
+          }
+        },
+        y: {
+          position: 'right',
+          min: 0,
+          max: 100,
+          grid: { color: '#343434', drawTicks: false, drawBorder: false },
+          border: { display: false },
+          ticks: {
+            stepSize: 50,
+            color: '#6e6d6b',
+            font: { size: 10, family: 'JetBrains Mono, ui-monospace, monospace' },
+            padding: 6,
+            callback: (v) => `${v} %`
+          }
+        }
+      }
+    }
+  });
+}
+
+function pushPoint(chart, seriesIndex, value) {
+  const data = chart.data.datasets[seriesIndex].data;
+  data.push(value === undefined ? null : value);
+  while (data.length > chart.data.labels.length) data.shift();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   Per-GPU card construction
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* Which secondary series a vendor can plot. Each entry declares how to pull
+   a 0-100 value out of a sample block, and how to render its legend text in
+   the metric's REAL unit — plotting a normalised percentage while labelling
+   it in MHz or MiB is what keeps the second chart honest. */
+const SECONDARY_SERIES = {
+  intel: [
+    {
+      name: 'Clock',
+      pct: (g) => (g.frequency && g.frequency.actual !== undefined && g.frequency.max)
+        ? Math.min(100, (g.frequency.actual / g.frequency.max) * 100) : undefined,
+      text: (g) => (g.frequency && g.frequency.actual !== undefined)
+        ? `${Math.round(g.frequency.actual)} MHz` : '—'
+    },
+    {
+      name: 'Idle (RC6)',
+      pct: (g) => g.rc6 ? g.rc6.value : undefined,
+      text: (g) => g.rc6 ? fmtPct(g.rc6.value) : '—'
+    }
+  ],
+  amd: [
+    {
+      name: 'VRAM used',
+      pct: (g) => g.memory ? g.memory.used_pct : undefined,
+      text: (g) => (g.memory && g.memory.used_mib !== undefined)
+        ? `${Math.round(g.memory.used_mib)} MiB` : '—'
+    },
+    {
+      name: 'Memory bus',
+      pct: (g) => g.memory ? g.memory.busy_pct : undefined,
+      text: (g) => (g.memory && g.memory.busy_pct !== undefined)
+        ? fmtPct(g.memory.busy_pct) : '—'
+    },
+    {
+      name: 'Clock',
+      pct: (g) => (g.frequency && g.frequency.actual !== undefined && g.frequency.max)
+        ? Math.min(100, (g.frequency.actual / g.frequency.max) * 100) : undefined,
+      text: (g) => (g.frequency && g.frequency.actual !== undefined)
+        ? `${Math.round(g.frequency.actual)} MHz` : '—'
+    }
+  ],
+  nvidia: [
+    {
+      name: 'VRAM used',
+      pct: (g) => g.memory ? g.memory.used_pct : undefined,
+      text: (g) => (g.memory && g.memory.used_mib !== undefined)
+        ? `${Math.round(g.memory.used_mib)} MiB` : '—'
+    },
+    {
+      name: 'Clock',
+      pct: (g) => (g.frequency && g.frequency.actual !== undefined && g.frequency.max)
+        ? Math.min(100, (g.frequency.actual / g.frequency.max) * 100) : undefined,
+      text: (g) => (g.frequency && g.frequency.actual !== undefined)
+        ? `${Math.round(g.frequency.actual)} MHz` : '—'
+    }
+  ]
+};
+
+const SECONDARY_TITLE = {
+  intel: 'Clock and Idle History',
+  amd: 'Memory and Clock History',
+  nvidia: 'Memory and Clock History'
+};
+
+function buildLegend(container, names, colors) {
+  const items = [];
+  names.forEach((name, i) => {
+    const item = el('div', 'legend-item');
+    const swatch = el('span', 'swatch');
+    swatch.style.background = colors[i % colors.length];
+    const label = el('span', 'label', name);
+    const value = el('span', 'value', '—');
+    item.append(swatch, label, value);
+    container.appendChild(item);
+    items.push({ root: item, value });
+  });
+  return items;
+}
+
+function buildCard(device) {
+  const card = el('section', 'gpu');
+  card.dataset.uid = device.uid;
+
+  /* Header */
+  const head = el('div', 'gpu-head');
+  head.appendChild(el('h2', null, device.name));
+  const badge = el('span', `badge ${device.vendor}`, device.vendor);
+  head.appendChild(badge);
+  head.appendChild(el('span', 'spacer'));
+  if (device.pci_address) {
+    head.appendChild(el('span', 'gpu-sub', device.pci_address));
+  }
+  card.appendChild(head);
+
+  /* Backend error banner, if this GPU's backend reported one */
+  let errorBanner = null;
+  if (device.backend_error) {
+    errorBanner = el('div', 'banner warn', device.backend_error);
+    errorBanner.style.margin = '0.9rem 1rem 0';
+    card.appendChild(errorBanner);
+  }
+
+  /* ── Section 1: engine history ── */
+  const engineNames = device.engine_names || [];
+  const s1 = el('div', 'section');
+  s1.appendChild(el('h3', null, 'Engine History'));
+  const plot1 = el('div', 'plot');
+  const canvas1 = document.createElement('canvas');
+  plot1.appendChild(canvas1);
+  s1.appendChild(plot1);
+  const legend1 = el('div', 'legend');
+  s1.appendChild(legend1);
+
+  /* Stat strip: whole-GPU numbers that aren't time series */
+  const stats = el('div', 'stats');
+  const statDefs = [
+    { key: 'util', label: 'Utilisation' },
+    { key: 'clock', label: 'Clock' },
+    { key: 'memory', label: 'Memory' },
+    { key: 'power', label: 'Power' },
+    { key: 'temp', label: 'Temp' }
+  ];
+  const statEls = {};
+  statDefs.forEach((def) => {
+    const stat = el('div', 'stat');
+    stat.appendChild(el('span', 'k', def.label));
+    const v = el('span', 'v na', '—');
+    stat.appendChild(v);
+    stats.appendChild(stat);
+    statEls[def.key] = v;
+  });
+  s1.appendChild(stats);
+  card.appendChild(s1);
+
+  /* ── Section 2: secondary history ── */
+  const secondary = SECONDARY_SERIES[device.vendor] || [];
+  let canvas2 = null, legend2 = null;
+  if (secondary.length) {
+    const s2 = el('div', 'section');
+    s2.appendChild(el('h3', null, SECONDARY_TITLE[device.vendor] || 'Secondary History'));
+    const plot2 = el('div', 'plot');
+    canvas2 = document.createElement('canvas');
+    plot2.appendChild(canvas2);
+    s2.appendChild(plot2);
+    legend2 = el('div', 'legend');
+    s2.appendChild(legend2);
+    card.appendChild(s2);
+  }
+
+  /* ── Section 3: per-container usage ── */
+  const s3 = el('div', 'section');
+  s3.appendChild(el('h3', null, 'Container GPU Usage'));
+  const bars = el('div', 'bars');
+  const emptyMsg = el('div', 'empty', 'Waiting for container data…');
+  s3.append(bars, emptyMsg);
+  card.appendChild(s3);
+
+  $('gpus').appendChild(card);
+
+  /* Charts last: the canvases must be in the document and laid out before
+     Chart.js measures them, or the first render is sized to 0. */
+  let chart1 = null, chart2 = null;
+  let legendItems1 = [], legendItems2 = [];
+  try {
+    if (engineNames.length) {
+      chart1 = makeChart(canvas1, engineNames, ENGINE_COLORS);
+      legendItems1 = buildLegend(legend1, engineNames, ENGINE_COLORS);
+    } else {
+      s1.replaceChild(
+        el('div', 'empty', 'This GPU reports no per-engine counters.'), plot1);
+    }
+    if (canvas2) {
+      const names = secondary.map((s) => s.name);
+      chart2 = makeChart(canvas2, names, SECONDARY_COLORS);
+      legendItems2 = buildLegend(legend2, names, SECONDARY_COLORS);
+    }
+  } catch (err) {
+    console.error('Chart init failed for', device.uid, err);
+    state.chartsOk = false;
+  }
+
+  return {
+    device,
+    root: card,
+    chart1, chart2,
+    legendItems1, legendItems2,
+    secondary,
+    engineNames,
+    statEls,
+    bars,
+    emptyMsg,
+    barRows: new Map()
+  };
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   Rendering a sample into a card
+   ═══════════════════════════════════════════════════════════════════════ */
+
+function applySample(card, gpu, opts) {
+  const live = !opts || opts.live !== false;
+
+  /* Engine chart */
+  if (card.chart1) {
+    card.engineNames.forEach((name, i) => {
+      const entry = gpu.engines ? gpu.engines[name] : undefined;
+      const value = entry ? entry.busy : undefined;
+      pushPoint(card.chart1, i, value);
+      if (live && card.legendItems1[i]) {
+        card.legendItems1[i].value.textContent = fmtPct(value);
+        card.legendItems1[i].root.classList.toggle('off', value === undefined);
+      }
+    });
+  }
+
+  /* Secondary chart */
+  if (card.chart2) {
+    card.secondary.forEach((series, i) => {
+      let value;
+      try { value = series.pct(gpu); } catch (e) { value = undefined; }
+      pushPoint(card.chart2, i, value);
+      if (live && card.legendItems2[i]) {
+        let text = '—';
+        try { text = series.text(gpu); } catch (e) { text = '—'; }
+        card.legendItems2[i].value.textContent = text;
+        card.legendItems2[i].root.classList.toggle('off', value === undefined);
+      }
+    });
+  }
+
+  if (!live) return;
+
+  /* Stat strip */
+  setStat(card.statEls.util, gpu.utilisation ? fmtPct(gpu.utilisation.value) : null);
+  setStat(card.statEls.clock,
+    (gpu.frequency && gpu.frequency.actual !== undefined)
+      ? `${Math.round(gpu.frequency.actual)} MHz` : null);
+  setStat(card.statEls.memory, formatMemory(gpu.memory));
+  setStat(card.statEls.power, gpu.power ? `${gpu.power.watts.toFixed(1)} W` : null);
+  setStat(card.statEls.temp, gpu.temperature ? `${gpu.temperature.celsius.toFixed(0)} °C` : null);
+
+  updateBars(card, gpu.containers);
+}
+
+function formatMemory(memory) {
+  if (!memory || memory.used_mib === undefined) return null;
+  if (memory.total_mib) {
+    return `${Math.round(memory.used_mib)} / ${Math.round(memory.total_mib)} MiB`;
+  }
+  return `${Math.round(memory.used_mib)} MiB`;
+}
+
+function setStat(node, text) {
+  if (!node) return;
+  node.textContent = text === null || text === undefined ? '—' : text;
+  node.classList.toggle('na', text === null || text === undefined);
+}
+
+/* Container rows are UPDATED in place, never rebuilt — recreating the DOM
+   would restart the CSS width transition on every tick and make the bars
+   jitter instead of glide. */
+function updateBars(card, containers) {
+  if (!containers) {
+    card.emptyMsg.textContent =
+      'Per-container attribution is unavailable for this GPU.';
+    card.emptyMsg.hidden = false;
+    return;
+  }
+
+  const names = Object.keys(containers);
+  if (!names.length) {
+    card.emptyMsg.textContent = 'No GPU-capable containers detected.';
+    card.emptyMsg.hidden = false;
+  } else {
+    card.emptyMsg.hidden = true;
+  }
+
+  /* Active first (by descending total), then idle alphabetically, then
+     "host" pinned to the bottom — it's the catch-all, not a container. */
+  names.sort((a, b) => {
+    if (a === 'host') return 1;
+    if (b === 'host') return -1;
+    const ta = containers[a].total || 0;
+    const tb = containers[b].total || 0;
+    if (ta > 0 || tb > 0) return tb - ta;
+    return a.localeCompare(b);
+  });
+
+  const seen = new Set();
+  names.forEach((name) => {
+    seen.add(name);
+    const total = containers[name].total || 0;
+    let row = card.barRows.get(name);
+
+    if (!row) {
+      const root = el('div', 'bar-row');
+      const label = el('div', 'bar-name', name);
+      const track = el('div', 'bar-track');
+      const fill = el('div', 'bar-fill');
+      fill.style.background = barColor(name);
+      track.appendChild(fill);
+      const val = el('div', 'bar-val', '0%');
+      root.append(label, track, val);
+      card.bars.appendChild(root);
+      row = { root, fill, val };
+      card.barRows.set(name, row);
+    }
+
+    row.fill.style.width = `${Math.max(0, Math.min(100, total))}%`;
+    row.val.textContent = `${total.toFixed(1)}%`;
+    row.root.classList.toggle('idle', total <= 0);
+    card.bars.appendChild(row.root);   /* reorder in place */
+  });
+
+  /* A row that vanished means the container stopped — remove immediately
+     rather than fading, because idle containers stay listed at 0%. */
+  for (const [name, row] of card.barRows) {
+    if (!seen.has(name)) {
+      row.root.remove();
+      card.barRows.delete(name);
+    }
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   Wiring
+   ═══════════════════════════════════════════════════════════════════════ */
+
+function ensureCards(devices) {
+  const incoming = devices.map((d) => d.uid).join('|');
+
+  /* FIX-P10-HTML-1: guarded by `state.built`, NOT by `state.order` alone.
+     On a host where every backend probes and finds nothing, `devices` is []
+     so `incoming` is '', and the initial `state.order` is [] which also
+     joins to ''. The old equality check therefore returned early on the
+     very first frame, and `$('blank').hidden = false` below was never
+     reached — the whole "No GPUs are being monitored" panel was unreachable
+     code, on precisely the host that most needs to read it. */
+  if (state.built && incoming === state.order.join('|')) return;
+  state.built = true;
+
+  $('gpus').innerHTML = '';
+  state.cards.clear();
+  state.devices = devices;
+  state.order = devices.map((d) => d.uid);
+
+  devices.forEach((device) => {
+    state.cards.set(device.uid, buildCard(device));
+  });
+
+  $('blank').hidden = devices.length > 0;
+  updateMeta();
+}
+
+function updateMeta() {
+  const count = state.devices.length;
+  if (!count) { $('meta').textContent = ''; return; }
+  const vendors = {};
+  state.devices.forEach((d) => { vendors[d.vendor] = (vendors[d.vendor] || 0) + 1; });
+  const parts = Object.keys(vendors).sort().map((v) => `${vendors[v]} ${v}`);
+  $('meta').innerHTML =
+    `<strong>${count}</strong> GPU${count === 1 ? '' : 's'} · ${parts.join(' · ')}`;
+}
+
+function applyConfig(config) {
+  if (!config) return;
+  const changed =
+    config.chart_window_s !== WINDOW_S ||
+    config.sample_interval_s !== SAMPLE_INTERVAL_S;
+  WINDOW_S = config.chart_window_s || WINDOW_S;
+  SAMPLE_INTERVAL_S = config.sample_interval_s || SAMPLE_INTERVAL_S;
+  /* Force a rebuild so the axis length matches the new window. */
+  if (changed) { state.order = []; state.built = false; }
+}
+
+function handleSample(sample, opts) {
+  if (!sample || !Array.isArray(sample.gpus)) return;
+  sample.gpus.forEach((gpu) => {
+    const card = state.cards.get(gpu.uid);
+    if (card) applySample(card, gpu, opts);
+  });
+}
+
+function redrawAll() {
+  state.cards.forEach((card) => {
+    if (card.chart1) card.chart1.update('none');
+    if (card.chart2) card.chart2.update('none');
+  });
+}
+
+function setStatus(kind, text) {
+  const dot = $('dot');
+  dot.className = `dot ${kind}`;
+  $('conn').textContent = text;
+}
+
+function showBanner(text) {
+  const banner = $('banner');
+  banner.textContent = text;
+  banner.hidden = false;
+}
+
+function clearBanner() { $('banner').hidden = true; }
+
+let socket = null;
+let reconnectDelay = 1000;
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  setStatus('connecting', 'Connecting…');
+
+  socket = new WebSocket(`${proto}//${location.host}/ws`);
+
+  socket.onopen = () => {
+    reconnectDelay = 1000;
+    setStatus('live', 'Live');
+  };
+
+  socket.onmessage = (event) => {
+    let msg;
+    try { msg = JSON.parse(event.data); } catch (e) { return; }
+
+    if (msg.type === 'devices') {
+      applyConfig(msg.data.config);
+      ensureCards(msg.data.gpus || []);
+    } else if (msg.type === 'history') {
+      /* Replay without touching legends or bars — only the last frame
+         should decide what "now" reads as. */
+      (msg.data || []).forEach((s) => handleSample(s, { live: false }));
+      const last = (msg.data || [])[msg.data.length - 1];
+      if (last) handleSample(last, { live: true });
+      redrawAll();
+    } else if (msg.type === 'sample') {
+      handleSample(msg.data, { live: true });
+      redrawAll();
+    }
+  };
+
+  socket.onclose = () => {
+    setStatus('down', 'Disconnected — retrying');
+    setTimeout(connect, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 2, 15000);
+  };
+
+  socket.onerror = () => { try { socket.close(); } catch (e) {} };
+}
+
+async function checkHealth() {
+  try {
+    const res = await fetch('/health');
+    const h = await res.json();
+    if (h.gpu_error) {
+      showBanner(h.gpu_error);
+    } else if (!h.gpu_detected) {
+      showBanner('No GPU detected by any enabled backend. ' +
+                 'Check /dev/dri passthrough and the GPU_ENABLE_* switches in .env.');
+    } else {
+      clearBanner();
+    }
+  } catch (e) {
+    /* Backend unreachable — the connection dot already says so. */
+  }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  if (typeof Chart === 'undefined') {
+    showBanner('Charts are disabled: chart.umd.min.js failed to load. ' +
+               'Confirm app/static/chart.umd.min.js exists, then hard-refresh.');
+  }
+  connect();
+  checkHealth();
+  setInterval(checkHealth, 5000);
+});
+</script>
+</body>
+</html>
