@@ -1,128 +1,34 @@
-# ─────────────────────────────────────────────────────────────────────────────
-#  gpu-monitor
-#
-#  FIX-P10-DC-1: YOU SHOULD NOT NEED TO EDIT THIS FILE.
-#  Timezone and the per-vendor GPU switches now live in .env:
-#
-#      cp .env.example .env      # then edit .env
-#
-#  Compose reads .env automatically from this directory and substitutes it
-#  into the ${...} placeholders below. Every placeholder carries a working
-#  default, so the stack still comes up correctly with no .env at all.
-#
-#  The one exception is the NVIDIA `deploy:` block at the bottom — Compose
-#  cannot conditionally include a whole YAML block from an env var, so that
-#  stays a manual uncomment. See .env for the host setup it requires.
-# ─────────────────────────────────────────────────────────────────────────────
+# gpu-monitor — see QUICKSTART.md for setup, every setting, and NVIDIA hosts.
+# Configuration lives in .env. You should not need to edit this file.
 services:
   gpu-monitor:
-    build:
-      context: .
+    image: ghcr.io/dean1850/gpu-monitor:latest
     container_name: gpu-monitor
     restart: unless-stopped
-    ports:
-      - "8088:8088"
+    runtime: ${DOCKER_RUNTIME:-runc}
+    pid: host
 
-    # ── DRM passthrough — serves Intel (i915/xe) and AMD (amdgpu) ────────
-    # NVIDIA does NOT use this; see the nvidia block near the bottom.
+    ports:
+      - "${GPU_MONITOR_PORT:-8088}:8088"
+
+    env_file:
+      - path: .env
+        required: false
+
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-void}
+      NVIDIA_DRIVER_CAPABILITIES: utility,compute,video
+
     devices:
       - /dev/dri:/dev/dri
 
-    # FIX-P9-DC-1: engine-busy counters come from the i915 perf PMU via the
-    # perf_event_open() syscall, which needs CAP_PERFMON (Linux >= 5.8) or
-    # CAP_SYS_ADMIN. Passing /dev/dri through is NOT enough on its own —
-    # without these the syscall fails with EACCES/EPERM and the app falls
-    # back to sysfs-only metrics, reporting the reason via /health.
-    #
-    # FIX-P11-DC-1: SYS_PTRACE added. Per-container attribution reads
-    # /proc/<pid>/fd and /proc/<pid>/fdinfo for processes owned by other
-    # users. Without CAP_SYS_PTRACE those reads fail with EACCES for any
-    # container that drops to a non-root user — linuxserver.io images being
-    # the common case — and those containers silently never appear in the
-    # per-container rows.
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
     cap_add:
       - PERFMON
       - SYS_ADMIN
       - SYS_PTRACE
 
-    # FIX-P9-DC-2: Docker's DEFAULT SECCOMP PROFILE blocks perf_event_open()
-    # on many engine versions even when CAP_PERFMON is granted — this is the
-    # usual reason the syscall still fails after adding the caps above.
-    # Unconfined seccomp lets that syscall family through; the caps above
-    # remain the real privilege boundary.
     security_opt:
       - seccomp:unconfined
-
-    # FIX-P9-DC-3: `pid: host` is required. Per-container attribution scans
-    # /proc/<pid>/fd for DRM render-node fds across every PID on the HOST.
-    # Without this the container only sees its own PID namespace and can
-    # never find them. The trade-off is read-only visibility of every host
-    # process via /proc — fine for a LAN-only homelab box, worth knowing if
-    # this is ever exposed more widely.
-    pid: host
-
-    environment:
-      # ══════════════════════════════════════════════════════════════════
-      # SET THESE IN .env — see .env.example for the full explanation.
-      # ══════════════════════════════════════════════════════════════════
-
-      # FIX-P10-DC-2: timezone is now a documented .env setting rather than
-      # an undocumented interpolation. Affects displayed clock times only.
-      - TZ=${TZ:-UTC}
-
-      # ── Vendor switches ───────────────────────────────────────────────
-      # Tri-state, one per vendor, all three may be on simultaneously:
-      #   auto  (default) enable only if the hardware is actually detected
-      #   true            force on; if absent, say so loudly via /health
-      #   false           never probe (skips the sysfs walk / library load)
-      - GPU_ENABLE_INTEL=${GPU_ENABLE_INTEL:-auto}
-      - GPU_ENABLE_AMD=${GPU_ENABLE_AMD:-auto}
-      - GPU_ENABLE_NVIDIA=${GPU_ENABLE_NVIDIA:-auto}
-
-      # ══════════════════════════════════════════════════════════════════
-      # Tuning — deliberately NOT in .env. The defaults are correct for
-      # essentially every host; edit here only if you know why you're
-      # changing them. Keeping them out of .env keeps that file short
-      # enough that people actually read it.
-      # ══════════════════════════════════════════════════════════════════
-
-      # ── Sampling and display ──────────────────────────────────────────
-      - GPU_SAMPLE_INTERVAL_S=${GPU_SAMPLE_INTERVAL_S:-1.0}
-      - GPU_HISTORY_SIZE=${GPU_HISTORY_SIZE:-300}
-      - GPU_CHART_WINDOW_S=${GPU_CHART_WINDOW_S:-60}
-
-      # Set false to skip the Docker socket and the /proc scan entirely.
-      - GPU_CONTAINER_ATTRIBUTION=${GPU_CONTAINER_ATTRIBUTION:-true}
-
-      # Emit the pre-Prompt-9 flat sample keys alongside the new gpus[] list.
-      - GPU_LEGACY_SAMPLE_FIELDS=${GPU_LEGACY_SAMPLE_FIELDS:-true}
-
-    # FIX-P6-DC-1: docker socket mounted READ-ONLY. Without :ro the container
-    # could control the Docker daemon, which is a privilege boundary breach.
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-
-    # ══════════════════════════════════════════════════════════════════════
-    # NVIDIA — UNCOMMENT TO ENABLE
-    # ══════════════════════════════════════════════════════════════════════
-    # NVIDIA GPUs are NOT reachable through /dev/dri. The container needs a
-    # device reservation, which in turn needs the NVIDIA Container Toolkit
-    # installed and configured on the Docker host:
-    #
-    #   1. Install the toolkit (see NVIDIA's docs for your distro).
-    #   2. sudo nvidia-ctk runtime configure --runtime=docker
-    #   3. sudo systemctl restart docker
-    #   4. Verify:  docker run --rm --gpus all ubuntu nvidia-smi
-    #   5. Uncomment the block below and redeploy.
-    #
-    # Without step 4 passing, this block will make `docker compose up` fail
-    # outright rather than degrade — which is deliberate: a reservation you
-    # asked for and didn't get should be loud.
-    #
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: all
-    #           capabilities: [gpu, utility, compute, video]

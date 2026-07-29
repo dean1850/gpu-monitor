@@ -21,9 +21,9 @@ encoder / decoder percentages directly — already normalised, so there is no
 delta arithmetic here at all.
 
 CONTAINER PREREQUISITE: seeing an NVIDIA GPU from inside a container needs
-the NVIDIA Container Toolkit on the host and a device reservation in
-docker-compose.yml.  ``/dev/dri`` passthrough alone is NOT sufficient.  See
-the commented block in docker-compose.yml.
+the NVIDIA Container Toolkit on the host, plus ``DOCKER_RUNTIME=nvidia`` and
+``NVIDIA_VISIBLE_DEVICES=all`` in ``.env``.  ``/dev/dri`` passthrough alone is
+NOT sufficient.  See QUICKSTART.md.
 """
 
 from __future__ import annotations
@@ -157,8 +157,9 @@ class _Nvml:
         raise NvmlError(
             NVML_ERROR_LIBRARY_NOT_FOUND,
             "libnvidia-ml.so.1 not found. On a container this normally means "
-            "the NVIDIA Container Toolkit is not wired up — see the nvidia "
-            f"block in docker-compose.yml. ({last_error})",
+            "the NVIDIA Container Toolkit is not wired up — set "
+            "DOCKER_RUNTIME=nvidia and NVIDIA_VISIBLE_DEVICES=all in .env "
+            f"(see QUICKSTART.md). ({last_error})",
         )
 
     def _sym(self, *names: str):
@@ -410,8 +411,9 @@ class NvidiaBackend(GpuBackend):
                 self._fail(
                     "no_device",
                     "GPU_ENABLE_NVIDIA=true but NVML reports zero devices. In a "
-                    "container this usually means the GPU was not reserved — "
-                    "check the deploy.resources block in docker-compose.yml.",
+                    "container this usually means the GPU was not injected — "
+                    "check DOCKER_RUNTIME=nvidia and NVIDIA_VISIBLE_DEVICES=all "
+                    "in .env (see QUICKSTART.md).",
                 )
             self._nvml.shutdown()
             return []

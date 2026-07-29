@@ -6,10 +6,13 @@ Runtime configuration — environment variables only.
 FIX-P11-CFG-1: NEW MODULE.  Prompt 9 adds multi-vendor GPU support, which
 needs per-vendor enable/disable switches.  Rather than introduce a config
 file format (and a YAML dependency), every knob is an environment variable
-set in ``docker-compose.yml`` — compose *is* the config file, it is already
-the single place this deployment is described, and it needs no new parser,
-no volume mount, and no "did you rebuild after editing config.yaml?" class
-of bug.
+read from ``.env`` (which compose passes through via ``env_file``) — that is
+already the single place this deployment is configured, and it needs no new
+parser, no volume mount, and no "did you rebuild after editing config.yaml?"
+class of bug.
+
+Every default below is duplicated nowhere: ``.env`` is optional, so anything
+absent falls back to the value in this module.
 
 Vendor switches are TRI-STATE, not boolean:
 
@@ -55,7 +58,7 @@ def _tristate(name: str, default: str = MODE_AUTO) -> str:
     Parse a tri-state env var into MODE_AUTO / MODE_ON / MODE_OFF.
 
     FIX-P11-CFG-2: unrecognised values fall back to the default and log a
-    warning rather than raising.  A typo in compose ("GPU_ENABLE_INTEL=ture")
+    warning rather than raising.  A typo in .env ("GPU_ENABLE_INTEL=ture")
     must not prevent the container from starting — it should start, monitor
     what it can, and tell you what it ignored.
     """

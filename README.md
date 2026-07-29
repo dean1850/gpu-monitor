@@ -1,6 +1,7 @@
 # gpu-monitor
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Image: ghcr.io](https://img.shields.io/badge/image-ghcr.io%2Fdean1850%2Fgpu--monitor-2496ed?logo=docker&logoColor=white)](https://github.com/dean1850/gpu-monitor/pkgs/container/gpu-monitor)
 
 **A self-hosted, real-time GPU dashboard that tells you *which container* is
 using the GPU — not just that something is.**
@@ -61,29 +62,23 @@ before putting it anywhere else — it needs real privileges to do what it does.
 
 ## Quick start
 
+No clone, no build — the image is published to GitHub Container Registry.
+
 ```bash
-git clone https://github.com/<your-user>/gpu-monitor.git
-cd gpu-monitor
+mkdir gpu-monitor && cd gpu-monitor
 
-# 1. Create your config. Defaults work as-is; edit if you want to.
-cp .env.example .env
+curl -O https://raw.githubusercontent.com/dean1850/gpu-monitor/main/docker-compose.yml
+curl -o .env https://raw.githubusercontent.com/dean1850/gpu-monitor/main/.env.example
 
-# 2. Build and start.
-docker compose up -d --build
+docker compose up -d
 ```
 
 Open **`http://<your-host>:8088`**.
-
-> **`--build` is not optional.** `docker compose up -d` on its own silently
-> reuses the cached image, and every change you just made will appear to do
-> nothing. This catches everyone exactly once.
 
 That's the whole install. With the default `auto` vendor switches, whatever
 GPUs the host actually has show up and the rest stay silent — no inventory
 step, no per-vendor setup, with one exception: **NVIDIA needs host-side
 toolkit setup first**, covered [below](#nvidia-setup).
-
-**Verify it's working:**
 
 ```bash
 docker logs gpu-monitor          # one line per backend probe result
@@ -94,58 +89,37 @@ Then put load on the GPU — start a transcode, run an inference job — and
 watch the relevant engine line climb with the responsible container named
 underneath it.
 
+**→ [QUICKSTART.md](QUICKSTART.md)** covers every setting, NVIDIA host setup,
+updating, reduced-privilege mode, troubleshooting, and building from source.
+
 ---
 
 ## Configuration
 
-Everything a normal user needs is in **`.env`**, which Docker Compose reads
-automatically from the project directory. It is git-ignored, so your settings
-survive `git pull` and never end up in a commit.
-
-```bash
-cp .env.example .env
-$EDITOR .env
-docker compose up -d --build
-```
+Everything lives in **`.env`**, next to `docker-compose.yml`. Compose reads it
+automatically and passes it through, so you never edit the compose file. It is
+git-ignored, so your settings never end up in a commit.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `TZ` | `UTC` | Any IANA name, e.g. `Europe/Berlin`, `America/New_York`. Affects displayed clock times only |
+| `TZ` | `UTC` | Any IANA name, e.g. `Europe/Berlin`. Affects displayed clock times only |
 | `GPU_ENABLE_INTEL` | `auto` | `auto` \| `true` \| `false` |
 | `GPU_ENABLE_AMD` | `auto` | `auto` \| `true` \| `false` |
 | `GPU_ENABLE_NVIDIA` | `auto` | `auto` \| `true` \| `false` |
+| `GPU_MONITOR_PORT` | `8088` | Host port for the dashboard |
+| `DOCKER_RUNTIME` | `runc` | `nvidia` on [NVIDIA hosts](#nvidia-setup) |
+| `NVIDIA_VISIBLE_DEVICES` | `void` | `all` on [NVIDIA hosts](#nvidia-setup) |
 
-Every value has a working default baked into `docker-compose.yml`, so the
-stack still starts correctly if you skip `.env` entirely.
+Every setting has the same default baked into the image, so the stack still
+starts correctly if you skip `.env` entirely. Five more sampling and display
+knobs exist for people who want them —
+see [tuning](QUICKSTART.md#tuning).
 
-### The vendor switches are tri-state
-
-This matters more than it sounds:
-
-- **`auto`** — enable the backend only if matching hardware is actually
-  found. Absent hardware is silent, not an error. Correct on a machine you
-  haven't inventoried, which is why it's the default.
-- **`true`** — force it on. If the card or its userspace library is missing,
-  `/health` says so explicitly and the dashboard shows why. Use this when you
-  *expect* a card to be there and want to be told loudly if it isn't — the
-  fastest way to debug a passthrough or driver problem.
-- **`false`** — never probe. No sysfs walk, no `dlopen`. Keeps logs and
-  `/health` clean on a host that will never have that vendor.
-
-All three can be on at once.
-
-### Tuning (edit `docker-compose.yml`)
-
-Deliberately kept out of `.env` so that file stays short enough to read. The
-defaults are right for essentially every host.
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `GPU_SAMPLE_INTERVAL_S` | `1.0` | Sampling period, clamped to 0.2–60 |
-| `GPU_HISTORY_SIZE` | `300` | Samples retained for replay to new clients |
-| `GPU_CHART_WINDOW_S` | `60` | Seconds visible on each chart |
-| `GPU_CONTAINER_ATTRIBUTION` | `true` | `false` skips Docker and `/proc` entirely |
-| `GPU_LEGACY_SAMPLE_FIELDS` | `true` | Also emit the flat pre-multi-GPU sample keys |
+The vendor switches are **tri-state**, which matters more than it sounds:
+`auto` enables a backend only if the hardware is actually found, `true` forces
+it on and makes a missing card an explicit error in `/health` instead of
+silence, `false` never probes at all. All three vendors can be on at once.
+Full explanation in [QUICKSTART.md](QUICKSTART.md#the-vendor-switches-are-tri-state).
 
 ---
 
@@ -189,10 +163,16 @@ sudo systemctl restart docker
 docker run --rm --gpus all ubuntu nvidia-smi
 ```
 
-Once that prints a device table, uncomment the `deploy:` block at the bottom
-of `docker-compose.yml` and redeploy. Compose can't conditionally include a
-YAML block from an environment variable, which is why this one step isn't in
-`.env`.
+Once that prints a device table, set both of these in `.env` and
+`docker compose up -d`:
+
+```ini
+DOCKER_RUNTIME=nvidia
+NVIDIA_VISIBLE_DEVICES=all
+```
+
+No YAML to uncomment. Details, and what to do on a host with no `/dev/dri` at
+all, are in [QUICKSTART.md](QUICKSTART.md#nvidia-hosts).
 
 Leaving `GPU_ENABLE_NVIDIA=auto` without doing any of this is harmless — the
 backend finds no `libnvidia-ml.so.1`, logs one line, and skips itself.
@@ -218,8 +198,10 @@ control the Docker daemon, which is a full host compromise — if you fork
 this, don't remove it.
 
 To run in a reduced-privilege mode, set `GPU_CONTAINER_ATTRIBUTION=false` in
-`docker-compose.yml` and remove `pid: host`, `CAP_SYS_PTRACE` and the socket
-mount. You keep whole-GPU metrics and lose the per-container breakdown.
+`.env` and remove `pid: host`, `CAP_SYS_PTRACE` and the socket mount from
+`docker-compose.yml`. You keep whole-GPU metrics and lose the per-container
+breakdown — see
+[reduced-privilege mode](QUICKSTART.md#reduced-privilege-mode).
 
 ---
 
@@ -239,27 +221,17 @@ per vendor, exactly which probe failed and why.
 
 ## Troubleshooting
 
-**Engine charts are empty but clock and RC6 work.**
-`perf_event_open()` is being blocked. Check `cap_add` and
-`security_opt: seccomp:unconfined` in `docker-compose.yml`, then confirm with
-`curl -s localhost:8088/health | grep error`.
+Start with `docker logs gpu-monitor`, which reports each backend's probe result
+on startup, then `/health`, which says per vendor exactly which probe failed
+and why.
 
-**A container that uses the GPU isn't listed.**
-Check `/health` → `container_resolver.gpu_containers_by_access`. If it isn't
-under `drm`, the container's GPU access isn't being detected — confirm it has
-`/dev/dri` via `devices:`, `volumes:`, or `privileged: true`. If it *is*
-listed but shows 0%, it has access but isn't currently using the GPU.
+The two most common cases: **engine charts empty while clock and RC6 work**
+means `perf_event_open()` is blocked, so check the `cap_add` entries and
+`seccomp:unconfined` are still present in `docker-compose.yml`. **A GPU you
+know is there doesn't appear** — set that vendor's switch to `true` in `.env`,
+which turns the silence into an explicit reason.
 
-**A GPU I know is present doesn't appear.**
-Set that vendor's switch to `true` in `.env` and redeploy. `auto` stays quiet
-about hardware it can't find; `true` makes the failure explicit in `/health`
-and in the dashboard.
-
-**Nothing appears at all.**
-`docker logs gpu-monitor` reports each backend's probe result on startup.
-
-**Changes to `.env` didn't take effect.**
-You forgot `--build`. Everyone does, once.
+Full list in [QUICKSTART.md](QUICKSTART.md#troubleshooting).
 
 ---
 
@@ -289,13 +261,28 @@ host where two of the three vendors are absent:
 
 ---
 
-## Tests
+## Development
+
+The published image is built and pushed by
+[`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml)
+on every push to `main` (`:latest`) and every `v*` tag (`:1.2.3`, `:1.2`).
+The tests gate the push. No repository secrets are needed — GHCR accepts the
+workflow's built-in `GITHUB_TOKEN`.
+
+> **One-time step after the first successful run:** GHCR packages start
+> **private**, so `docker compose pull` fails for everyone else until you set
+> the package public — repo → *Packages* → `gpu-monitor` → *Package settings* →
+> *Change visibility*.
 
 ```bash
+git clone https://github.com/dean1850/gpu-monitor.git
+cd gpu-monitor
 python3 tests/test_gpu_monitor.py
 ```
 
-Runs on a machine with no GPU at all — kernel and Docker data are mocked.
+Tests run on a machine with no GPU at all — kernel and Docker data are mocked,
+and no dependencies are needed. To run your own build instead of the published
+image, see [building from source](QUICKSTART.md#building-from-source).
 
 ---
 

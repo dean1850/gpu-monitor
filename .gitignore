@@ -1,0 +1,14 @@
+# Local configuration — never commit your own settings.
+# Note: .env.example IS tracked; only the real .env is ignored.
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
