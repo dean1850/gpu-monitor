@@ -6,8 +6,9 @@
 **A self-hosted, real-time GPU dashboard that tells you *which container* is
 using the GPU — not just that something is.**
 
-Intel, AMD and NVIDIA, concurrently, on the same host. One section per card.
-Dark mode, modelled on GNOME System Monitor's Resources tab.
+Intel, AMD and NVIDIA, concurrently, on the same host — every card on one
+screen, no scrolling. Dark mode, modelled on GNOME System Monitor's
+Resources tab.
 
 ![gpu-monitor dashboard showing an Intel, an AMD and an NVIDIA GPU](docs/screenshot.png)
 
@@ -41,9 +42,22 @@ Some specifics that shaped the design:
   Compute, NVIDIA's Encode and Decode.
 - **Mixed vendors are a first-class case,** not a bolt-on. An iGPU handling
   transcodes alongside a discrete card doing inference is an ordinary homelab
-  arrangement. Each card gets its own titled section with a coloured vendor
-  badge, its own engine chart, and its own container breakdown, so it's
-  obvious at a glance which card is doing the work.
+  arrangement. Each GPU gets its own panel with a coloured vendor badge, its
+  own engine chart, and its own container breakdown, so it's obvious at a
+  glance which card is doing the work.
+- **It fits on the screen.** Three GPUs side by side with no scrollbar from
+  1280x800 upward: one column per GPU, each with stat tiles (clock, VRAM,
+  power, temperature, RC6 idle) carrying their own sparklines over the chart
+  window. One GPU gets a full-height plot with a stats sidebar instead, two
+  get two columns, more than three add columns until they'd fall below 330px
+  and then wrap to a second row — shedding sparklines and shortening the
+  container list as cards get shorter. A phone scrolls normally.
+- **Colours you can actually tell apart.** The engine palette is Adwaita
+  stepped for a dark surface and checked against simulated protanopia and
+  deuteranopia, not chosen by eye: worst adjacent pair OKLab dE 8.6, every
+  line clearing 3:1 contrast on the card. `tools/screenshots.mjs` regenerates
+  the screenshots above and asserts the no-scroll promise across twelve
+  viewport-and-GPU-count combinations.
 - **No fabricated numbers.** An Intel iGPU has no dedicated VRAM, no power
   sensor and no temperature sensor exposed through i915. Those fields render
   as `—`, never as a plausible-looking zero.
@@ -136,14 +150,20 @@ Full explanation in [QUICKSTART.md](QUICKSTART.md#the-vendor-switches-are-tri-st
 | Temperature | — | hwmon | NVML |
 | Per-container attribution | `/proc/*/fdinfo` | `/proc/*/fdinfo` | NVML process utilisation |
 
-Anything a host can't report shows as `—`, never as a fabricated zero. This
-is why the Intel section below has three empty stat fields and the AMD one
-doesn't — that's correct behaviour, not a bug:
+Anything a host can't report shows as `—`, never as a fabricated zero, and a
+tile with nothing to report draws no sparkline either. This is why the Intel
+card below has three empty stat tiles while the AMD and NVIDIA cards above
+fill theirs — that's correct behaviour, not a bug:
 
 ![gpu-monitor with a single Intel iGPU](docs/screenshot-intel.png)
 
 > Both screenshots are the real dashboard rendered headlessly against
 > synthetic samples, so the values are representative rather than measured.
+> Regenerate them with `node tools/screenshots.mjs` (needs Playwright with
+> Chromium); `node tools/screenshots.mjs --check` asserts that nothing
+> overflows the viewport for one, two, three, four and six GPUs across
+> 1280x800, 1366x768 and 1920x1080 — and that a phone scrolls only
+> vertically.
 
 ---
 
@@ -250,6 +270,12 @@ app/
 │   ├── amd.py             amdgpu sysfs + hwmon
 │   └── nvidia.py          NVML via ctypes
 └── static/index.html      Dashboard (Chart.js bundled locally, no CDN)
+
+tools/
+├── screenshots.mjs        Headless render of the dashboard against synthetic
+│                          samples: regenerates docs/*.png and asserts the
+│                          single-screen layout fits (`--check`)
+└── playwright-loader.mjs  Finds Playwright in a local or global install
 ```
 
 Three rules every backend follows, because the dashboard has to work on a
@@ -278,6 +304,11 @@ workflow's built-in `GITHUB_TOKEN`.
 git clone https://github.com/dean1850/gpu-monitor.git
 cd gpu-monitor
 python3 tests/test_gpu_monitor.py
+
+# Frontend: assert the single-screen layout, then regenerate the screenshots.
+# Needs Playwright with Chromium; nothing else, and no GPU.
+node tools/screenshots.mjs --check
+node tools/screenshots.mjs
 ```
 
 Tests run on a machine with no GPU at all — kernel and Docker data are mocked,
