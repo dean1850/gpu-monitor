@@ -30,7 +30,11 @@ Emitted sample shape::
           "rc6":         {"value": 88.1},                      # optional
           "memory":      {"used_mib": ..., "total_mib": ...},  # optional
           "power":       {"watts": 12.4},                      # optional
-          "temperature": {"celsius": 43.0},                    # optional
+          "temperature": {"celsius": 43.0, "sensor": "edge",   # optional
+                          "channels": {"edge": 43.0, "junction": 51.0}},
+          "fan":         {"rpm": 1100.0, "pct": 31.4},         # optional
+          "voltage":     {"gfx_mv": 806},                      # optional
+          "power_state": "active" | "suspended",               # optional
           "containers":  {"jellyfin": {...}, "host": {...}}    # optional
         }
       ],
@@ -227,13 +231,18 @@ class GpuReader:
             if not backend.devices:
                 continue
 
+            # Attribution BEFORE sample: the AMD backend derives its engine
+            # breakdown from this tick's fdinfo pass.  In the old order the
+            # engine chart showed the previous tick's attribution while the
+            # container rows showed this one's, so the two views — documented
+            # as guaranteed-consistent — were always one interval apart.
+            attribution = self._attribution_for(backend)
+
             try:
                 metrics = backend.sample()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("GpuReader: %s sample() failed: %s", backend.vendor, exc)
                 metrics = {}
-
-            attribution = self._attribution_for(backend)
 
             for device in backend.devices:
                 block: dict = {

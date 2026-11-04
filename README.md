@@ -47,7 +47,7 @@ Some specifics that shaped the design:
   glance which card is doing the work.
 - **It fits on the screen.** Three GPUs side by side with no scrollbar from
   1280x800 upward: one column per GPU, each with stat tiles (clock, VRAM,
-  power, temperature, RC6 idle) carrying their own sparklines over the chart
+  power, every temperature sensor, fan, RC6 idle) carrying their own sparklines over the chart
   window. One GPU gets a full-height plot with a stats sidebar instead, two
   get two columns, more than three add columns until they'd fall below 330px
   and then wrap to a second row — shedding sparklines and shortening the
@@ -146,9 +146,18 @@ Full explanation in [QUICKSTART.md](QUICKSTART.md#the-vendor-switches-are-tri-st
 | Clock | sysfs | hwmon / `pp_dpm_sclk` | NVML |
 | Idle residency (RC6) | sysfs | — | — |
 | VRAM | — (shared system RAM) | `mem_info_vram_*` | NVML |
-| Power | — | hwmon | NVML |
-| Temperature | — | hwmon | NVML |
+| Power | — | hwmon (`power1_average` or `power1_input`, plus board limit) | NVML |
+| Temperature | — | hwmon: every sensor — edge, hotspot (junction), VRAM | NVML |
+| Fan | — | hwmon `fan1_input` / `pwm1` | — |
 | Per-container attribution | `/proc/*/fdinfo` | `/proc/*/fdinfo` | NVML process utilisation |
+
+AMD notes: an idle Radeon parks its shader clock in deep sleep, so a clock of
+a few MHz (or 0) at idle is real, not a fault. A headless card may also be
+runtime-suspended by the kernel; its header then shows **asleep** and the
+sensor tiles read `—` until something uses the GPU, because the driver refuses
+sensor reads rather than wake the card. Hover the Clock, Power and Fan tiles
+for memory clock, core voltage, power limit and fan duty. `GET /health` lists
+exactly which sysfs/hwmon file each AMD metric was read from.
 
 Anything a host can't report shows as `—`, never as a fabricated zero, and a
 tile with nothing to report draws no sparkline either. This is why the Intel

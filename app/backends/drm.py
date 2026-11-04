@@ -69,16 +69,41 @@ _KNOWN_DEVICE_NAMES: dict[tuple[int, int], str] = {
     (0x8086, 0x56A0): "Intel Arc A770",
     (0x8086, 0x56A1): "Intel Arc A750",
     (0x8086, 0x56A5): "Intel Arc A380",
-    # AMD parts common in homelabs.
-    (0x1002, 0x164E): "AMD Raphael iGPU",
-    (0x1002, 0x1636): "AMD Renoir iGPU",
-    (0x1002, 0x15E7): "AMD Barcelo iGPU",
-    (0x1002, 0x731F): "AMD Radeon RX 5700 XT",
-    (0x1002, 0x73BF): "AMD Radeon RX 6900 XT",
-    (0x1002, 0x73DF): "AMD Radeon RX 6700 XT",
-    (0x1002, 0x744C): "AMD Radeon RX 7900 XTX",
-    (0x1002, 0x747E): "AMD Radeon RX 7700 XT",
-    (0x1002, 0x67DF): "AMD Radeon RX 480/580",
+    # AMD parts common in homelabs.  Names are the bracketed marketing names
+    # from the upstream pci.ids database; where one PCI ID covers several
+    # SKUs (they differ only by PCI revision) all of them are listed.
+    #   APUs
+    (0x1002, 0x15E7): "AMD Radeon Graphics (Barcelo)",
+    (0x1002, 0x1636): "AMD Radeon Vega (Renoir)",
+    (0x1002, 0x1638): "AMD Radeon Vega (Cezanne)",
+    (0x1002, 0x164E): "AMD Radeon 610M (Raphael)",
+    (0x1002, 0x1681): "AMD Radeon 660M / 680M",
+    (0x1002, 0x15BF): "AMD Radeon 740M / 760M / 780M",
+    (0x1002, 0x1900): "AMD Radeon 760M / 780M",
+    (0x1002, 0x150E): "AMD Radeon 880M / 890M",
+    #   Polaris / RDNA1
+    (0x1002, 0x67DF): "AMD Radeon RX 470/480/570/580/590",
+    (0x1002, 0x731F): "AMD Radeon RX 5600 XT / 5700 / 5700 XT",
+    (0x1002, 0x7340): "AMD Radeon RX 5500",
+    #   RDNA2
+    (0x1002, 0x73A5): "AMD Radeon RX 6950 XT",
+    (0x1002, 0x73AF): "AMD Radeon RX 6900 XT",
+    (0x1002, 0x73BF): "AMD Radeon RX 6800 / 6800 XT / 6900 XT",
+    (0x1002, 0x73DF): "AMD Radeon RX 6700 / 6700 XT / 6750 XT",
+    (0x1002, 0x73EF): "AMD Radeon RX 6650 XT",
+    (0x1002, 0x73FF): "AMD Radeon RX 6600 / 6600 XT",
+    (0x1002, 0x743F): "AMD Radeon RX 6400 / 6500 XT",
+    #   RDNA3
+    (0x1002, 0x744C): "AMD Radeon RX 7900 XT / XTX / GRE",
+    (0x1002, 0x7448): "AMD Radeon Pro W7900",
+    (0x1002, 0x745E): "AMD Radeon Pro W7800",
+    (0x1002, 0x747E): "AMD Radeon RX 7700 XT / 7800 XT",
+    (0x1002, 0x7480): "AMD Radeon RX 7600 / 7600 XT",
+    (0x1002, 0x7489): "AMD Radeon Pro W7500",
+    (0x1002, 0x7499): "AMD Radeon RX 7400 / 7300 / Pro W7400",
+    #   RDNA4
+    (0x1002, 0x7550): "AMD Radeon RX 9070 / 9070 XT",
+    (0x1002, 0x7590): "AMD Radeon RX 9060 XT",
 }
 
 _PCI_IDS_PATHS = (
@@ -173,8 +198,18 @@ def device_display_name(vendor_id: int, device_id: int, driver: str | None) -> s
 
     from_db = _lookup_pci_ids_file(vendor_id, device_id)
     if from_db:
-        vendor_label = _VENDOR_ID_TO_NAME.get(vendor_id, "GPU").upper()
-        if vendor_label.lower() in from_db.lower():
+        # pci.ids spells most GPUs "<codename> [<marketing name>]", e.g.
+        # "Navi 33 [Radeon RX 7400/7300/Pro W7400]". The bracketed part is
+        # what's printed on the box, so prefer it when present.
+        bracket = re.search(r"\[([^\]]+)\]", from_db)
+        if bracket:
+            from_db = bracket.group(1).strip()
+        vendor_label = {
+            PCI_VENDOR_INTEL: "Intel",
+            PCI_VENDOR_AMD: "AMD",
+            PCI_VENDOR_NVIDIA: "NVIDIA",
+        }.get(vendor_id, "")
+        if not vendor_label or vendor_label.lower() in from_db.lower():
             return from_db
         return f"{vendor_label} {from_db}"
 
@@ -460,6 +495,9 @@ def _parse_fdinfo(info_text: str) -> tuple[str | None, dict[str, int]]:
             raw_name = key[len(_DRM_ENGINE_PREFIX):].strip()
             ns = parse_ns_value(value.strip())
             if ns is not None and raw_name:
-                engines[raw_name] = ns
+                # Summed, not assigned: amdgpu maps two hardware IPs onto one
+                # name (UVD and VCN_DEC are both "dec", VCE and VCN_ENC both
+                # "enc"), so a repeated key is more work, not a correction.
+                engines[raw_name] = engines.get(raw_name, 0) + ns
 
     return client_id, engines

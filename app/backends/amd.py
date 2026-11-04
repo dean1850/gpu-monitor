@@ -20,8 +20,13 @@ Metric sources (all under ``/sys/class/drm/cardN/device/``):
     mem_info_vram_total   VRAM fitted, bytes
     pp_dpm_sclk           shader-clock DPM table; the active state is
                           flagged with a trailing '*'
-    hwmon/hwmonN/         power1_average (µW), temp1_input (m°C),
-                          freq1_input (Hz)
+    hwmon/hwmonN/         every sensor the driver exposes:
+                            temp{1,2,3}_input   edge / junction / mem (m°C)
+                            power1_average|power1_input, power1_cap (µW)
+                            freq1_input (sclk), freq2_input (mclk)   (Hz)
+                            fan1_input (RPM), pwm1 / pwm1_max
+                            in0_input (vddgfx, mV)
+    power/runtime_status  "suspended" while the card is runtime-powered-off
 
 Engine breakdown comes from ``/proc/<pid>/fdinfo`` (``drm-engine-gfx``,
 ``-compute``, ``-dec``, ``-enc``) summed across clients, because amdgpu
@@ -80,7 +85,36 @@ _KEY_TO_DISPLAY: dict[str, str] = {
     "encode": "Encode",
 }
 
-_SCLK_ACTIVE_RE = re.compile(r"^\s*\d+:\s*(\d+)\s*Mhz\s*\*", re.IGNORECASE | re.MULTILINE)
+# FIX-AMD-CLK-1: the active DPM level is the line carrying a '*'.  Modern
+# kernels (smu_cmn_print_dpm_clk_levels) print a deep-sleep pseudo-level
+# labelled "S:" rather than a number when the clock is below half the lowest
+# DPM state — which is where an idle RDNA2/3/4 card spends almost all its
+# time:
+#
+#     S: 12Mhz *
+#     1: 500Mhz
+#     2: 2600Mhz
+#
+# The old pattern only accepted numeric labels, so an idle card reported no
+# clock at all and the tile showed "—" except during brief bursts of load.
+_SCLK_ACTIVE_RE = re.compile(
+    r"^\s*(?:\d+|S):\s*(\d+)\s*Mhz\s*\*", re.IGNORECASE | re.MULTILINE
+)
+_SCLK_LEVEL_RE = re.compile(r"^\s*\d+:\s*(\d+)\s*Mhz", re.IGNORECASE | re.MULTILINE)
+
+# hwmon temperature channel -> (key, display label).  amdgpu fixes the
+# channel order (temp1 edge, temp2 junction, temp3 mem) and also exports a
+# tempN_label file, which wins when present.
+_TEMP_DEFAULT_KEYS: dict[int, str] = {1: "edge", 2: "junction", 3: "mem"}
+_TEMP_LABELS: dict[str, str] = {
+    "edge": "Edge",
+    "junction": "Hotspot",
+    "mem": "VRAM",
+}
+# Order the primary "temperature" value is chosen in.  Edge is what every
+# other tool calls "GPU temperature"; APUs and some server parts only
+# expose one channel, so fall through to whatever exists.
+_TEMP_PRIMARY_ORDER: tuple[str, ...] = ("edge", "junction", "mem")
 
 
 class AmdBackend(GpuBackend):
@@ -94,6 +128,7 @@ class AmdBackend(GpuBackend):
         self._prev_attrib_wall: float | None = None
         # Last attribution result, reused to synthesise aggregate engine %.
         self._last_attrib: dict[str, dict[int, dict[str, float]]] = {}
+        self._attrib_ran = False
 
     # ── discovery ────────────────────────────────────────────────────────
 
@@ -145,14 +180,43 @@ class AmdBackend(GpuBackend):
                 (os.path.join(device_dir, "mem_info_vram_total"),)
             )
             device.extra["sclk"] = first_existing((os.path.join(device_dir, "pp_dpm_sclk"),))
+            device.extra["runtime_status"] = first_existing(
+                (os.path.join(device_dir, "power", "runtime_status"),)
+            )
             device.extra.update(self._find_hwmon(device_dir))
+
+            temps = device.extra["temps"]
+            device.sensors = {
+                "temperatures": [
+                    {"key": key, "label": _TEMP_LABELS.get(key, key.title())}
+                    for key, _path in temps
+                ],
+                "fan": bool(device.extra["fan_rpm"]),
+                "voltage": bool(device.extra["vddgfx"]),
+            }
+            device.sources = {
+                name: device.extra[name]
+                for name in (
+                    "busy", "mem_busy", "vram_used", "vram_total", "sclk",
+                    "runtime_status", "hwmon_freq", "hwmon_mclk", "power_cap",
+                    "fan_rpm", "pwm", "vddgfx",
+                )
+            }
+            device.sources["power"] = list(device.extra["power"])
+            device.sources["temps"] = {key: path for key, path in temps}
             devices.append(device)
 
             logger.info(
-                "amd: found %s (%s) — busy=%s vram=%s hwmon_power=%s hwmon_temp=%s",
+                "amd: found %s (%s) — busy=%s vram=%s power=%s temps=%s fan=%s "
+                "sclk=%s runtime_pm=%s",
                 device.name, uid,
                 bool(device.extra["busy"]), bool(device.extra["vram_total"]),
-                bool(device.extra.get("power")), bool(device.extra.get("temp")),
+                bool(device.extra["power"]),
+                ",".join(key for key, _ in temps) or "none",
+                bool(device.extra["fan_rpm"]),
+                "hwmon" if device.extra["hwmon_freq"]
+                else ("pp_dpm_sclk" if device.extra["sclk"] else "none"),
+                _read_word(device.extra["runtime_status"]) or "n/a",
             )
 
             if device.extra["busy"] is None and self._forced:
@@ -168,22 +232,76 @@ class AmdBackend(GpuBackend):
         return devices
 
     @staticmethod
-    def _find_hwmon(device_dir: str) -> dict[str, str | None]:
-        """Resolve the hwmon instance attached to this GPU, if any."""
-        out: dict[str, str | None] = {"power": None, "temp": None, "hwmon_freq": None}
+    def _find_hwmon(device_dir: str) -> dict:
+        """
+        Resolve every hwmon sensor attached to this GPU.
+
+        FIX-AMD-HWMON-1: previously only temp1_input (edge) was read, so the
+        junction/hotspot and VRAM temperatures, fan and voltage that
+        ``sensors`` shows for the same card never reached the dashboard, and
+        a card whose temp1 read failed showed no temperature at all.
+
+        Paths are resolved by EXISTENCE only, never by a trial read: a card
+        that is runtime-suspended at startup refuses every hwmon read with
+        EPERM, and must not be permanently written off for it.
+        """
+        out: dict = {
+            "power": [],            # candidates, tried in order every tick
+            "power_cap": None,
+            "temps": [],            # [(key, path)] in channel order
+            "hwmon_freq": None,
+            "hwmon_mclk": None,
+            "fan_rpm": None,
+            "pwm": None,
+            "pwm_max": None,
+            "vddgfx": None,
+        }
+        seen_keys: set[str] = set()
+
         for hwmon_dir in sorted(glob.glob(os.path.join(device_dir, "hwmon", "hwmon*"))):
-            out["power"] = out["power"] or first_existing(
-                (
-                    os.path.join(hwmon_dir, "power1_average"),
-                    os.path.join(hwmon_dir, "power1_input"),
-                )
-            )
-            out["temp"] = out["temp"] or first_existing(
-                (os.path.join(hwmon_dir, "temp1_input"),)
-            )
-            out["hwmon_freq"] = out["hwmon_freq"] or first_existing(
-                (os.path.join(hwmon_dir, "freq1_input"),)
-            )
+            def p(name: str, _d: str = hwmon_dir) -> str | None:
+                return first_existing((os.path.join(_d, name),))
+
+            # Not all products support both average and instantaneous power
+            # (SMU13 parts dropped power1_average in newer kernels), and the
+            # one that exists can still fail transiently — so keep both and
+            # take the first that actually reads on each tick.
+            for name in ("power1_average", "power1_input"):
+                path = p(name)
+                if path and path not in out["power"]:
+                    out["power"].append(path)
+            out["power_cap"] = out["power_cap"] or p("power1_cap")
+
+            for channel in range(1, 10):
+                path = p(f"temp{channel}_input")
+                if path is None:
+                    continue
+                key = _hwmon_label(hwmon_dir, f"temp{channel}_label")
+                key = key or _TEMP_DEFAULT_KEYS.get(channel, f"temp{channel}")
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                out["temps"].append((key, path))
+
+            for channel in (1, 2):
+                path = p(f"freq{channel}_input")
+                if path is None:
+                    continue
+                label = _hwmon_label(hwmon_dir, f"freq{channel}_label")
+                label = label or ("sclk" if channel == 1 else "mclk")
+                slot = "hwmon_freq" if label == "sclk" else "hwmon_mclk"
+                out[slot] = out[slot] or path
+
+            out["fan_rpm"] = out["fan_rpm"] or p("fan1_input")
+            out["pwm"] = out["pwm"] or p("pwm1")
+            out["pwm_max"] = out["pwm_max"] or p("pwm1_max")
+
+            for channel in range(0, 3):
+                path = p(f"in{channel}_input")
+                if path and _hwmon_label(hwmon_dir, f"in{channel}_label") in (None, "vddgfx"):
+                    out["vddgfx"] = out["vddgfx"] or path
+                    break
+
         return out
 
     # ── lifecycle ────────────────────────────────────────────────────────
@@ -213,11 +331,19 @@ class AmdBackend(GpuBackend):
     def _sample_device(self, device: GpuDevice) -> dict:
         block: dict = {}
 
+        # FIX-AMD-RPM-1: a headless dGPU is runtime-powered-off (BOCO/BACO)
+        # after a few idle seconds, and while it is, the driver refuses
+        # every sensor read rather than wake the card.  Without saying so the
+        # card just turns into a wall of dashes that looks like a bug.
+        state = _read_word(device.extra.get("runtime_status"))
+        if state:
+            block["power_state"] = "suspended" if state == "suspended" else "active"
+
         busy = read_int_file(device.extra.get("busy"))
         if busy is not None:
             block["utilisation"] = {"value": float(max(0, min(100, busy)))}
 
-        # Engine breakdown, summed from the last fdinfo attribution pass.
+        # Engine breakdown, summed from this tick's fdinfo attribution pass.
         engines = self._aggregate_engines(device.uid)
         if engines:
             block["engines"] = engines
@@ -234,15 +360,73 @@ class AmdBackend(GpuBackend):
         if mem_busy is not None:
             block.setdefault("memory", {})["busy_pct"] = float(max(0, min(100, mem_busy)))
 
-        power_uw = read_int_file(device.extra.get("power"))
-        if power_uw is not None:
-            block["power"] = {"watts": round(power_uw / 1_000_000.0, 2)}
+        power = self._read_power(device)
+        if power:
+            block["power"] = power
 
-        temp_mc = read_int_file(device.extra.get("temp"))
-        if temp_mc is not None:
-            block["temperature"] = {"celsius": round(temp_mc / 1000.0, 1)}
+        temperature = self._read_temperatures(device)
+        if temperature:
+            block["temperature"] = temperature
+
+        fan = self._read_fan(device)
+        if fan:
+            block["fan"] = fan
+
+        vddgfx = read_int_file(device.extra.get("vddgfx"))
+        if vddgfx is not None:
+            block["voltage"] = {"gfx_mv": vddgfx}
 
         return block
+
+    @staticmethod
+    def _read_power(device: GpuDevice) -> dict[str, float]:
+        power: dict[str, float] = {}
+        for path in device.extra.get("power") or ():
+            power_uw = read_int_file(path)
+            if power_uw is not None:
+                power["watts"] = round(power_uw / 1_000_000.0, 2)
+                break
+        if "watts" in power:
+            cap_uw = read_int_file(device.extra.get("power_cap"))
+            if cap_uw:
+                power["cap_watts"] = round(cap_uw / 1_000_000.0, 1)
+        return power
+
+    @staticmethod
+    def _read_temperatures(device: GpuDevice) -> dict:
+        channels: dict[str, float] = {}
+        for key, path in device.extra.get("temps") or ():
+            milli_c = read_int_file(path)
+            # amdgpu reports an unsupported/absent sensor as an error, but
+            # some firmware returns 0 or a large negative sentinel instead;
+            # neither is a temperature a running GPU can have.
+            if milli_c is None or milli_c <= 0 or milli_c > 150_000:
+                continue
+            channels[key] = round(milli_c / 1000.0, 1)
+
+        if not channels:
+            return {}
+
+        primary = next(
+            (k for k in _TEMP_PRIMARY_ORDER if k in channels), next(iter(channels))
+        )
+        return {
+            "celsius": channels[primary],
+            "sensor": primary,
+            "channels": channels,
+        }
+
+    @staticmethod
+    def _read_fan(device: GpuDevice) -> dict[str, float]:
+        fan: dict[str, float] = {}
+        rpm = read_int_file(device.extra.get("fan_rpm"))
+        if rpm is not None and rpm >= 0:
+            fan["rpm"] = float(rpm)
+        pwm = read_int_file(device.extra.get("pwm"))
+        if pwm is not None:
+            pwm_max = read_int_file(device.extra.get("pwm_max")) or 255
+            fan["pct"] = round(max(0.0, min(100.0, pwm * 100.0 / pwm_max)), 1)
+        return fan
 
     def _aggregate_engines(self, uid: str) -> dict[str, dict[str, float]]:
         """
@@ -256,9 +440,15 @@ class AmdBackend(GpuBackend):
         authoritative whole-GPU number (gpu_busy_percent) is still displayed
         separately as "utilisation".
         """
-        per_pid = self._last_attrib.get(uid)
-        if not per_pid:
+        # FIX-AMD-ENG-1: an idle GPU is 0%, not "unknown".  amdgpu only
+        # prints drm-engine-* lines for engines a client has actually used,
+        # so on an idle card there is nothing to sum — which used to blank
+        # the whole engine chart and grey out its legend.  Zeros are honest
+        # here because the scan DID run; only when attribution is off or
+        # failed (no scan this tick) is the breakdown truly unknown.
+        if not self._attrib_ran:
             return {}
+        per_pid = self._last_attrib.get(uid) or {}
 
         totals = {key: 0.0 for key in ENGINE_KEYS}
         for bucket in per_pid.values():
@@ -274,11 +464,15 @@ class AmdBackend(GpuBackend):
         freq: dict[str, float] = {}
 
         # Preferred: hwmon freq1_input, in Hz.
+        # FIX-AMD-CLK-2: 0 Hz is a real reading — the shader clock of an
+        # idle card in GFXOFF/deep sleep — not "missing".  Dropping it made
+        # an idle AMD card show "—" while an idle Intel iGPU shows "0".
         hz = read_int_file(device.extra.get("hwmon_freq"))
-        if hz is not None and hz > 0:
+        if hz is not None and hz >= 0:
             freq["actual"] = round(hz / 1_000_000.0, 1)
 
-        # Fallback / supplement: the starred entry in the DPM table.
+        # Fallback / supplement: the starred entry in the DPM table, plus the
+        # table's top level as the maximum.
         sclk_path = device.extra.get("sclk")
         if sclk_path:
             try:
@@ -288,9 +482,15 @@ class AmdBackend(GpuBackend):
             match = _SCLK_ACTIVE_RE.search(text)
             if match:
                 freq.setdefault("actual", float(match.group(1)))
-            levels = [int(m) for m in re.findall(r":\s*(\d+)\s*Mhz", text, re.IGNORECASE)]
+            # Numbered levels only: the "S:" deep-sleep line is a current
+            # reading, not a DPM state, and must not define the maximum.
+            levels = [int(m) for m in _SCLK_LEVEL_RE.findall(text)]
             if levels:
                 freq["max"] = float(max(levels))
+
+        mclk_hz = read_int_file(device.extra.get("hwmon_mclk"))
+        if mclk_hz is not None and mclk_hz >= 0:
+            freq["memory"] = round(mclk_hz / 1_000_000.0, 1)
 
         return freq
 
@@ -310,6 +510,7 @@ class AmdBackend(GpuBackend):
 
     def attribution(self) -> dict[str, dict[int, dict[str, float]]] | None:
         if self._scanner is None:
+            self._attrib_ran = False
             return None
         result = compute_fdinfo_attribution(
             scanner=self._scanner,
@@ -321,4 +522,24 @@ class AmdBackend(GpuBackend):
         # Cached so _aggregate_engines() can reuse it on the same tick
         # without a second /proc walk.
         self._last_attrib = result or {}
+        self._attrib_ran = result is not None
         return result
+
+
+# ── module helpers ───────────────────────────────────────────────────────
+
+
+def _read_word(path: str | None) -> str | None:
+    """First whitespace-delimited token of a small sysfs file, lower-cased."""
+    if path is None:
+        return None
+    try:
+        text = read_text(path).strip()
+    except OSError:
+        return None
+    return text.split()[0].lower() if text else None
+
+
+def _hwmon_label(hwmon_dir: str, name: str) -> str | None:
+    """Read an hwmon ``*_label`` file (e.g. temp2_label -> "junction")."""
+    return _read_word(os.path.join(hwmon_dir, name))

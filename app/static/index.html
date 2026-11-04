@@ -23,7 +23,8 @@
   markup work at 1280x800 with three cards and at 4K with one.
 
   FIX-P12-HTML-2: the second chart is gone, not the data.  Clock, RC6 idle,
-  VRAM, memory bus, power and temperature are now stat tiles, each with a
+  VRAM, memory bus, power, fan and every temperature sensor the card exposes
+  (edge / hotspot / VRAM on amdgpu) are now stat tiles, each with a
   sparkline over the same window the big chart covers.  That reclaims ~45% of
   each card's height and leaves one honest per-engine plot as the focus.
 
@@ -266,6 +267,19 @@ main {
   border: 1px solid currentColor;
   flex: none;
 }
+.chip-sleep {
+  font-size: 0.58rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 0.1rem 0.36rem;
+  border-radius: 4px;
+  color: var(--text-dim);
+  background: var(--track);
+  flex: none;
+  cursor: help;
+}
+.chip-sleep[hidden] { display: none; }
 .badge.intel  { color: #6fb3ff; }
 .badge.amd    { color: #ff7b6b; }
 .badge.nvidia { color: #78d96f; }
@@ -1005,7 +1019,15 @@ const TILES_BASE = [
     key: 'clock', label: 'Clock MHz', mode: 'pct',
     text: (g) => (g.frequency && g.frequency.actual !== undefined)
       ? `${Math.round(g.frequency.actual)}` : null,
-    spark: freqPct
+    spark: freqPct,
+    hint: (g) => {
+      const f = g.frequency || {};
+      const parts = [];
+      if (f.max) parts.push(`max ${Math.round(f.max)} MHz`);
+      if (f.memory !== undefined) parts.push(`memory ${Math.round(f.memory)} MHz`);
+      if (g.voltage && g.voltage.gfx_mv !== undefined) parts.push(`core ${g.voltage.gfx_mv} mV`);
+      return parts.join(' · ');
+    }
   },
   {
     key: 'memory', label: 'Memory MiB', mode: 'pct',
@@ -1014,15 +1036,50 @@ const TILES_BASE = [
   },
   {
     key: 'power', label: 'Power W', mode: 'auto',
-    text: (g) => g.power ? `${g.power.watts.toFixed(1)}` : null,
-    spark: (g) => g.power ? g.power.watts : undefined
-  },
-  {
-    key: 'temp', label: 'Temp °C', mode: 'auto',
-    text: (g) => g.temperature ? `${g.temperature.celsius.toFixed(0)}` : null,
-    spark: (g) => g.temperature ? g.temperature.celsius : undefined
+    /* "18.0/55" when the board limit is known, mirroring Memory's
+       used/total — the draw only means something relative to the cap. */
+    text: (g) => {
+      if (!g.power || g.power.watts === undefined) return null;
+      const w = g.power.watts.toFixed(1);
+      return g.power.cap_watts ? `${w}/${Math.round(g.power.cap_watts)}` : w;
+    },
+    spark: (g) => g.power ? g.power.watts : undefined,
+    hint: (g) => (g.power && g.power.cap_watts)
+      ? `board power limit ${g.power.cap_watts} W` : ''
   }
 ];
+
+/* Generic temperature tile, for GPUs whose backend reports one reading
+   without a per-sensor inventory (NVIDIA; Intel shows it as "—"). */
+const TILE_TEMP = {
+  key: 'temp', label: 'Temp °C', mode: 'auto',
+  text: (g) => g.temperature ? `${g.temperature.celsius.toFixed(0)}` : null,
+  spark: (g) => g.temperature ? g.temperature.celsius : undefined
+};
+
+/* One tile per hardware temperature sensor (amdgpu: edge, junction/hotspot,
+   VRAM) — the same set `sensors` prints. Built from the device's static
+   inventory, so a card only gets tiles for sensors it really has. */
+function tempTile(sensor) {
+  const read = (g) => (g.temperature && g.temperature.channels)
+    ? g.temperature.channels[sensor.key] : undefined;
+  return {
+    key: `temp:${sensor.key}`, label: `${sensor.label} °C`, mode: 'auto',
+    text: (g) => { const v = read(g); return v === undefined ? null : `${v.toFixed(0)}`; },
+    spark: read
+  };
+}
+
+const TILE_FAN = {
+  key: 'fan', label: 'Fan RPM', mode: 'auto',
+  text: (g) => {
+    if (!g.fan) return null;
+    if (g.fan.rpm !== undefined) return `${Math.round(g.fan.rpm)}`;
+    return g.fan.pct !== undefined ? fmtPct(g.fan.pct) : null;
+  },
+  spark: (g) => g.fan ? (g.fan.rpm !== undefined ? g.fan.rpm : g.fan.pct) : undefined,
+  hint: (g) => (g.fan && g.fan.pct !== undefined) ? `PWM duty ${g.fan.pct.toFixed(0)}%` : ''
+};
 
 /* Vendor extras — the series the old secondary chart carried that aren't in
    every vendor's vocabulary. */
@@ -1045,8 +1102,13 @@ const TILES_EXTRA = {
   nvidia: []
 };
 
-function tilesFor(vendor) {
-  return TILES_BASE.concat(TILES_EXTRA[vendor] || []);
+function tilesFor(device) {
+  const sensors = device.sensors || {};
+  const temps = Array.isArray(sensors.temperatures) ? sensors.temperatures : [];
+  return TILES_BASE
+    .concat(temps.length ? temps.map(tempTile) : [TILE_TEMP])
+    .concat(sensors.fan ? [TILE_FAN] : [])
+    .concat(TILES_EXTRA[device.vendor] || []);
 }
 
 function formatMemory(memory) {
@@ -1091,6 +1153,14 @@ function buildCard(device, index) {
   const head = el('div', 'gpu-head');
   head.appendChild(el('h2', null, device.name));
   head.appendChild(el('span', `badge ${device.vendor}`, device.vendor));
+  /* Shown while the kernel has the card runtime-powered-off: every sensor
+     read is refused then, and the dashes need an explanation. */
+  const sleepChip = el('span', 'chip-sleep', 'asleep');
+  sleepChip.title = 'Runtime-suspended by the kernel (idle power saving). ' +
+    'The driver refuses sensor reads until the card wakes, so readings ' +
+    'show "—" until something uses the GPU.';
+  sleepChip.hidden = true;
+  head.appendChild(sleepChip);
   head.appendChild(el('span', 'spacer'));
   if (device.pci_address) head.appendChild(el('span', 'gpu-sub', device.pci_address));
   inner.appendChild(head);
@@ -1103,7 +1173,7 @@ function buildCard(device, index) {
   }
 
   /* ── Stat tiles (what the old secondary chart used to plot) ── */
-  const tileDefs = tilesFor(device.vendor);
+  const tileDefs = tilesFor(device);
   const tileEls = {};
   if (!failed) {
     const tiles = el('div', 'tiles');
@@ -1115,7 +1185,7 @@ function buildCard(device, index) {
       const spark = new Sparkline(pointCount(), def.mode);
       tile.appendChild(spark.svg);
       tiles.appendChild(tile);
-      tileEls[def.key] = { value, spark };
+      tileEls[def.key] = { root: tile, value, spark };
     });
     inner.appendChild(tiles);
   }
@@ -1173,6 +1243,7 @@ function buildCard(device, index) {
     engineNames,
     tileDefs,
     tileEls,
+    sleepChip,
     plot,
     caption,
     bars,
@@ -1303,9 +1374,17 @@ function applySample(card, gpu, opts) {
     let text = null;
     try { text = def.text(gpu); } catch (e) { text = null; }
     setStat(tile.value, text);
+
+    if (def.hint) {
+      let hint = '';
+      try { hint = def.hint(gpu) || ''; } catch (e) { hint = ''; }
+      if (tile.root.title !== hint) tile.root.title = hint;
+    }
   });
 
   if (!live) return;
+
+  if (card.sleepChip) card.sleepChip.hidden = gpu.power_state !== 'suspended';
 
   card.lastContainers = gpu.containers || null;
   updateBars(card, gpu.containers);
