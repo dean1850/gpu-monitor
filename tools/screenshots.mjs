@@ -108,7 +108,22 @@ const HOSTS = {
     frequency: { max: 2755, walk: { start: 1686, min: 500, max: 2755, step: 160 } },
     memory: { total: 8192, walk: { start: 3820, min: 2600, max: 6900, step: 210 }, bus: { start: 25, min: 8, max: 52, step: 5 } },
     power: { start: 105, min: 42, max: 158, step: 9 },
+    powerCap: 165,
     temp: { start: 63, min: 52, max: 74, step: 1.4 },
+    /* amdgpu exports edge, junction (hotspot) and VRAM temperatures, a fan
+       and vddgfx — the same set `sensors` prints for the card. */
+    sensors: {
+      temperatures: [
+        { key: 'edge', label: 'Edge' },
+        { key: 'junction', label: 'Hotspot' },
+        { key: 'mem', label: 'VRAM' }
+      ],
+      fan: true,
+      voltage: true
+    },
+    hotspot: { start: 74, min: 61, max: 88, step: 1.8 },
+    memtemp: { start: 68, min: 58, max: 80, step: 1.2 },
+    fan: { start: 1450, min: 900, max: 2100, step: 90 },
     containers: { ollama: 0.7, 'stable-diffusion': 0.24, handbrake: 0.06, host: 0 }
   },
 
@@ -161,6 +176,7 @@ function synthesise(names) {
       driver: host.driver,
       engine_names: host.engine_names,
       engine_keys: host.engine_keys,
+      sensors: host.sensors || {},
       backend_error: null
     });
 
@@ -172,7 +188,10 @@ function synthesise(names) {
       mem: host.memory ? walk(rand, host.memory.walk) : null,
       membus: host.memory && host.memory.bus ? walk(rand, host.memory.bus) : null,
       power: host.power ? walk(rand, host.power) : null,
-      temp: host.temp ? walk(rand, host.temp) : null
+      temp: host.temp ? walk(rand, host.temp) : null,
+      hotspot: host.hotspot ? walk(rand, host.hotspot) : null,
+      memtemp: host.memtemp ? walk(rand, host.memtemp) : null,
+      fan: host.fan ? walk(rand, host.fan) : null
     });
   });
 
@@ -203,8 +222,17 @@ function synthesise(names) {
         };
         if (s.membus) block.memory.busy_pct = s.membus[t];
       }
-      if (s.power) block.power = { watts: s.power[t] };
+      if (s.power) {
+        block.power = { watts: s.power[t] };
+        if (host.powerCap) block.power.cap_watts = host.powerCap;
+      }
       if (s.temp) block.temperature = { celsius: s.temp[t] };
+      if (s.temp && s.hotspot) {
+        block.temperature.sensor = 'edge';
+        block.temperature.channels = { edge: s.temp[t], junction: s.hotspot[t] };
+        if (s.memtemp) block.temperature.channels.mem = s.memtemp[t];
+      }
+      if (s.fan) block.fan = { rpm: s.fan[t] };
 
       /* Attribution splits the busy total across the named containers in the
          host's fixed shares, so the bars stay consistent with the plot above

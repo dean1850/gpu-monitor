@@ -13,6 +13,8 @@ so the whole suite runs on a machine with no GPU at all:
   5. Config tri-state parsing and clamping
   6. DRM card enumeration + PCI-ordered sorting
   7. Backend contract — probe() never raises with no hardware present
+  8. AMD sysfs/hwmon — deep-sleep clock, every temperature sensor, fan,
+     power fallbacks, runtime-suspend, idle engine zeros (RX 7400 layout)
 
 Run:  python3 tests/test_gpu_monitor.py
 """
@@ -440,6 +442,234 @@ class TestBackendContract(unittest.TestCase):
             backend = IntelBackend()
             backend.probe()
             json.dumps(backend.status())
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 8. AMD backend against a fake amdgpu sysfs tree
+# ══════════════════════════════════════════════════════════════════════════
+
+# pp_dpm_sclk as printed by smu_cmn_print_dpm_clk_levels() on an idle
+# RDNA3 card: the deep-sleep pseudo-level carries the star, not a number.
+SCLK_DEEP_SLEEP = "S: 12Mhz *\n1: 500Mhz \n2: 2600Mhz \n"
+SCLK_ACTIVE = "0: 500Mhz \n1: 1873Mhz *\n2: 2600Mhz \n"
+
+
+class FakeAmdCard:
+    """A /sys/class/drm/cardN tree laid out the way amdgpu exports it."""
+
+    def __init__(self, root: str) -> None:
+        self.card_path = os.path.join(root, "card1")
+        self.device = os.path.join(self.card_path, "device")
+        self.hwmon = os.path.join(self.device, "hwmon", "hwmon3")
+        os.makedirs(self.hwmon)
+        os.makedirs(os.path.join(self.device, "power"))
+
+    def write(self, rel: str, value) -> None:
+        path = os.path.join(self.device, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(f"{value}\n")
+
+    def hw(self, name: str, value) -> None:
+        self.write(os.path.join("hwmon", "hwmon3", name), value)
+
+    def remove_hw(self, name: str) -> None:
+        os.remove(os.path.join(self.hwmon, name))
+
+    def rx7400(self) -> "FakeAmdCard":
+        """Sensors a Navi 33 (1002:7499) exposes, per amdgpu_pm.c."""
+        self.write("gpu_busy_percent", 0)
+        self.write("mem_busy_percent", 8)
+        self.write("mem_info_vram_used", 263 * 1024 * 1024)
+        self.write("mem_info_vram_total", 8176 * 1024 * 1024)
+        self.write("pp_dpm_sclk", SCLK_DEEP_SLEEP.rstrip("\n"))
+        self.write(os.path.join("power", "runtime_status"), "active")
+        self.hw("temp1_input", 63000)
+        self.hw("temp1_label", "edge")
+        self.hw("temp2_input", 71000)
+        self.hw("temp2_label", "junction")
+        self.hw("temp3_input", 66000)
+        self.hw("temp3_label", "mem")
+        # SMU13 on recent kernels: instantaneous power only.
+        self.hw("power1_input", 18_000_000)
+        self.hw("power1_cap", 55_000_000)
+        self.hw("freq1_input", 0)          # idle: GFXOFF / deep sleep
+        self.hw("freq1_label", "sclk")
+        self.hw("freq2_input", 96_000_000)
+        self.hw("freq2_label", "mclk")
+        self.hw("fan1_input", 0)           # zero-RPM fan stop
+        self.hw("pwm1", 0)
+        self.hw("pwm1_max", 255)
+        self.hw("in0_input", 6)
+        self.hw("in0_label", "vddgfx")
+        return self
+
+    def as_card(self) -> dict:
+        return {
+            "card": "card1",
+            "card_path": self.card_path,
+            "vendor_id": 0x1002,
+            "device_id": 0x7499,
+            "vendor": "amd",
+            "driver": "amdgpu",
+            "pci_address": "0000:03:00.0",
+            "render_node": "/dev/dri/renderD129",
+        }
+
+
+class TestAmdBackend(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.card = FakeAmdCard(self._tmp.name).rx7400()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _backend(self):
+        from backends import amd
+
+        with mock.patch.object(amd, "enumerate_drm_cards",
+                               return_value=[self.card.as_card()]):
+            backend = amd.AmdBackend()
+            devices = backend.probe()
+        self.assertEqual(len(devices), 1)
+        return backend, devices[0]
+
+    def _sample(self, backend, device):
+        block = backend.sample()[device.uid]
+        self.assertNotIn("error", block)
+        return block
+
+    def test_name_for_rx7400(self):
+        _backend, device = self._backend()
+        self.assertEqual(device.name, "AMD Radeon RX 7400 / 7300 / Pro W7400")
+
+    def test_sensor_inventory(self):
+        _backend, device = self._backend()
+        self.assertEqual(
+            [t["key"] for t in device.sensors["temperatures"]],
+            ["edge", "junction", "mem"],
+        )
+        self.assertEqual(
+            [t["label"] for t in device.sensors["temperatures"]],
+            ["Edge", "Hotspot", "VRAM"],
+        )
+        self.assertTrue(device.sensors["fan"])
+        self.assertTrue(device.sensors["voltage"])
+        # /health lists the resolved files; the per-sample identity doesn't.
+        self.assertIn("sources", device.describe(include_sources=True))
+        self.assertNotIn("sources", device.describe())
+
+    def test_all_temperatures_reported(self):
+        backend, device = self._backend()
+        temp = self._sample(backend, device)["temperature"]
+        self.assertEqual(temp["celsius"], 63.0)
+        self.assertEqual(temp["sensor"], "edge")
+        self.assertEqual(temp["channels"], {"edge": 63.0, "junction": 71.0, "mem": 66.0})
+
+    def test_primary_temperature_falls_back_when_edge_unreadable(self):
+        self.card.hw("temp1_input", "")  # read fails (driver returned error)
+        backend, device = self._backend()
+        temp = self._sample(backend, device)["temperature"]
+        self.assertEqual(temp["sensor"], "junction")
+        self.assertEqual(temp["celsius"], 71.0)
+        self.assertNotIn("edge", temp["channels"])
+
+    def test_unlabelled_channels_use_amdgpu_order(self):
+        for n in (1, 2, 3):
+            self.card.remove_hw(f"temp{n}_label")
+        _backend, device = self._backend()
+        self.assertEqual(
+            [t["key"] for t in device.sensors["temperatures"]],
+            ["edge", "junction", "mem"],
+        )
+
+    def test_idle_clock_is_zero_not_missing(self):
+        backend, device = self._backend()
+        freq = self._sample(backend, device)["frequency"]
+        self.assertEqual(freq["actual"], 0.0)
+        self.assertEqual(freq["max"], 2600.0)
+        self.assertEqual(freq["memory"], 96.0)
+
+    def test_deep_sleep_dpm_line_parsed_without_hwmon_freq(self):
+        self.card.remove_hw("freq1_input")
+        self.card.remove_hw("freq1_label")
+        backend, device = self._backend()
+        freq = self._sample(backend, device)["frequency"]
+        self.assertEqual(freq["actual"], 12.0)
+        # The "S:" reading must not be mistaken for a DPM level.
+        self.assertEqual(freq["max"], 2600.0)
+
+    def test_active_dpm_line_parsed(self):
+        self.card.remove_hw("freq1_input")
+        self.card.write("pp_dpm_sclk", SCLK_ACTIVE.rstrip("\n"))
+        backend, device = self._backend()
+        self.assertEqual(self._sample(backend, device)["frequency"]["actual"], 1873.0)
+
+    def test_power_input_used_when_no_average(self):
+        backend, device = self._backend()
+        power = self._sample(backend, device)["power"]
+        self.assertEqual(power, {"watts": 18.0, "cap_watts": 55.0})
+
+    def test_power_falls_back_when_average_unreadable(self):
+        self.card.hw("power1_average", "")  # exists, but the read fails
+        backend, device = self._backend()
+        self.assertEqual(self._sample(backend, device)["power"]["watts"], 18.0)
+
+    def test_fan_and_voltage(self):
+        self.card.hw("fan1_input", 1250)
+        self.card.hw("pwm1", 64)
+        backend, device = self._backend()
+        block = self._sample(backend, device)
+        self.assertEqual(block["fan"], {"rpm": 1250.0, "pct": 25.1})
+        self.assertEqual(block["voltage"], {"gfx_mv": 6})
+
+    def test_runtime_suspended_card(self):
+        # While runtime-suspended amdgpu refuses hwmon reads (EPERM); an
+        # unreadable file stands in for that here.
+        self.card.write(os.path.join("power", "runtime_status"), "suspended")
+        for name in ("temp1_input", "temp2_input", "temp3_input", "power1_input"):
+            self.card.hw(name, "")
+        backend, device = self._backend()
+        block = self._sample(backend, device)
+        self.assertEqual(block["power_state"], "suspended")
+        self.assertNotIn("temperature", block)
+        self.assertNotIn("power", block)
+        # Sensors that exist must stay listed so the tiles return on wake.
+        self.assertEqual(len(device.sensors["temperatures"]), 3)
+
+    def test_idle_engines_are_zero_after_a_scan(self):
+        backend, device = self._backend()
+        # No scan yet: the breakdown is genuinely unknown.
+        self.assertNotIn("engines", self._sample(backend, device))
+        backend._scanner = FakeScanner([{}, {}])
+        backend.attribution()
+        engines = self._sample(backend, device)["engines"]
+        self.assertEqual(set(engines), {"Graphics", "Compute", "Decode", "Encode"})
+        self.assertTrue(all(e["busy"] == 0.0 for e in engines.values()))
+
+
+class TestFdinfoParsing(unittest.TestCase):
+    def test_duplicate_engine_keys_are_summed(self):
+        text = (
+            "drm-client-id:\t7\n"
+            "drm-engine-dec:\t100 ns\n"
+            "drm-engine-dec:\t50 ns\n"
+            "drm-engine-gfx:\t10 ns\n"
+        )
+        client, engines = drm._parse_fdinfo(text)
+        self.assertEqual(client, "7")
+        self.assertEqual(engines, {"dec": 150, "gfx": 10})
+
+    def test_pci_ids_bracket_name_preferred(self):
+        with mock.patch.object(
+            drm, "_lookup_pci_ids_file",
+            return_value="Navi 99 [Radeon RX 9999 XT]",
+        ):
+            self.assertEqual(
+                drm.device_display_name(0x1002, 0xFFFF, "amdgpu"),
+                "AMD Radeon RX 9999 XT",
+            )
 
 
 if __name__ == "__main__":

@@ -65,13 +65,24 @@ class GpuDevice:
     # e.g. ("render", "blitter", "video", "video_enhance").
     engine_keys: tuple[str, ...] = ()
 
+    # Static sensor inventory the frontend builds its tiles from, e.g.
+    #   {"temperatures": [{"key": "edge", "label": "Edge"}, ...],
+    #    "fan": True, "voltage": True}
+    # Only sensors that actually exist on this card are listed, so an APU
+    # with one temperature channel gets one tile — not three dashes.
+    sensors: dict = field(default_factory=dict)
+
+    # Which sysfs/hwmon files each metric resolved to. Diagnostic only —
+    # surfaced through /health (backend status), never sent per sample.
+    sources: dict = field(default_factory=dict, repr=False)
+
     # Vendor-specific handles the backend needs on every tick (perf fds,
     # NVML device handle, hwmon paths). Never serialised.
     extra: dict = field(default_factory=dict, repr=False)
 
-    def describe(self) -> dict:
+    def describe(self, include_sources: bool = False) -> dict:
         """Static, JSON-serialisable identity — sent once, not per sample."""
-        return {
+        out = {
             "uid": self.uid,
             "vendor": self.vendor,
             "name": self.name,
@@ -81,7 +92,11 @@ class GpuDevice:
             "render_node": self.render_node,
             "engine_names": list(self.engine_names),
             "engine_keys": list(self.engine_keys),
+            "sensors": self.sensors,
         }
+        if include_sources:
+            out["sources"] = self.sources
+        return out
 
 
 class GpuBackend(ABC):
@@ -140,8 +155,13 @@ class GpuBackend(ABC):
             frequency    {"actual": MHz, "requested": MHz}
             memory       {"used_mib": n, "total_mib": n, "used_pct": 0-100}
             rc6          {"value": 0-100}     Intel idle residency
-            power        {"watts": n}
-            temperature  {"celsius": n}
+            power        {"watts": n, "cap_watts": n}
+            temperature  {"celsius": n,              primary sensor
+                          "sensor": "edge",          which one that is
+                          "channels": {"edge": n, "junction": n, "mem": n}}
+            fan          {"rpm": n, "pct": 0-100}
+            voltage      {"gfx_mv": n}
+            power_state  "active" | "suspended"  (runtime PM)
 
         MUST NOT raise.
         """
@@ -185,7 +205,7 @@ class GpuBackend(ABC):
             "active_source": self._active_source,
             "error": self._error,
             "error_kind": self._error_kind,
-            "devices": [d.describe() for d in self._devices],
+            "devices": [d.describe(include_sources=True) for d in self._devices],
         }
 
     # ── helpers shared by concrete backends ──────────────────────────────
