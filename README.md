@@ -58,9 +58,13 @@ Some specifics that shaped the design:
   line clearing 3:1 contrast on the card. `tools/screenshots.mjs` regenerates
   the screenshots above and asserts the no-scroll promise across twelve
   viewport-and-GPU-count combinations.
-- **No fabricated numbers.** An Intel iGPU has no dedicated VRAM, no power
-  sensor and no temperature sensor exposed through i915. Those fields render
-  as `—`, never as a plausible-looking zero.
+- **No fabricated numbers.** An Intel iGPU has no VRAM and no sensors of its
+  own in i915, so its Power, Temperature and Memory come from what the
+  hardware really has: the CPU's RAPL GPU plane, the CPU package sensor
+  (labelled **CPU pkg**, since the iGPU shares that die), and the shared RAM
+  its DRM clients hold. Where a host doesn't expose a source — RAPL and the
+  package sensor are usually missing inside a VM — the tile renders `—`,
+  never a plausible-looking zero.
 - **No shelling out.** No `intel_gpu_top`, no `nvidia-smi` subprocess, no
   vendor Python packages. Metrics come from `perf_event_open(2)`, sysfs,
   `/proc`, and NVML through `ctypes`. The whole thing is stdlib plus FastAPI.
@@ -145,9 +149,9 @@ Full explanation in [QUICKSTART.md](QUICKSTART.md#the-vendor-switches-are-tri-st
 | Overall utilisation | busiest engine | `gpu_busy_percent` | NVML |
 | Clock | sysfs | hwmon / `pp_dpm_sclk` | NVML |
 | Idle residency (RC6) | sysfs | — | — |
-| VRAM | — (shared system RAM) | `mem_info_vram_*` | NVML |
-| Power | — | hwmon (`power1_average` or `power1_input`, plus board limit) | NVML |
-| Temperature | — | hwmon: every sensor — edge, hotspot (junction), VRAM | NVML |
+| VRAM | iGPU: shared RAM held by DRM clients (fdinfo, kernel 6.8+) out of system RAM | `mem_info_vram_*` | NVML |
+| Power | iGPU: RAPL GPU plane (`power/energy-gpu`, else powercap `uncore`); Arc: hwmon `energy1_input` | hwmon (`power1_average` or `power1_input`, plus board limit) | NVML |
+| Temperature | iGPU: CPU package (coretemp / `x86_pkg_temp`); Arc on xe: hwmon | hwmon: every sensor — edge, hotspot (junction), VRAM | NVML |
 | Fan | — | hwmon `fan1_input` / `pwm1` | — |
 | Per-container attribution | `/proc/*/fdinfo` | `/proc/*/fdinfo` | NVML process utilisation |
 
@@ -159,10 +163,17 @@ sensor reads rather than wake the card. Hover the Clock, Power and Fan tiles
 for memory clock, core voltage, power limit and fan duty. `GET /health` lists
 exactly which sysfs/hwmon file each AMD metric was read from.
 
+Intel notes: the iGPU's memory figure needs container attribution on (it
+comes from the same fdinfo pass), and its temperature tile is the CPU package
+because that is the die the GPU sits on. Hover Power or Memory for the source.
+Inside a VM (e.g. Proxmox with the iGPU passed through) the hypervisor does
+not virtualise RAPL or the package thermal sensor, so Power and CPU pkg read
+`—` there — run on bare metal to get them.
+
 Anything a host can't report shows as `—`, never as a fabricated zero, and a
-tile with nothing to report draws no sparkline either. This is why the Intel
-card below has three empty stat tiles while the AMD and NVIDIA cards above
-fill theirs — that's correct behaviour, not a bug:
+tile with nothing to report draws no sparkline either. The Intel card below is
+a bare-metal host; in a VM its Power and temperature tiles would read `—`
+instead:
 
 ![gpu-monitor with a single Intel iGPU](docs/screenshot-intel.png)
 
