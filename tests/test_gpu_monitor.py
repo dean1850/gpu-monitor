@@ -701,6 +701,13 @@ class TestIntelSensors(unittest.TestCase):
             os.makedirs(d)
         with open(self.meminfo, "w") as f:
             f.write("MemTotal:       16384000 kB\nMemFree: 1 kB\n")
+        self.cpuinfo = os.path.join(self.root, "cpuinfo")
+        self._set_vm(False)
+
+    def _set_vm(self, in_vm: bool):
+        flags = "fpu vme sse sse2" + (" hypervisor" if in_vm else "")
+        with open(self.cpuinfo, "w") as f:
+            f.write(f"processor\t: 0\nflags\t\t: {flags}\n")
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -733,6 +740,7 @@ class TestIntelSensors(unittest.TestCase):
             mock.patch.object(intel, "THERMAL_CLASS_DIR", self.thermal),
             mock.patch.object(intel, "POWERCAP_DIR", self.powercap),
             mock.patch.object(intel, "MEMINFO_PATH", self.meminfo),
+            mock.patch.object(intel, "CPUINFO_PATH", self.cpuinfo),
             mock.patch.object(intel, "POWER_PMU_DIR", os.path.join(self.root, "nopmu")),
             mock.patch.object(intel.IntelBackend, "_find_pmu_dir", return_value=None),
         ]
@@ -786,7 +794,12 @@ class TestIntelSensors(unittest.TestCase):
         self.assertAlmostEqual(power["watts"], 2.0, delta=0.1)
 
     def test_vm_without_rapl_or_coretemp_reports_nothing(self):
+        self._set_vm(True)
         backend, device = self._backend()
+        notes = device.sensors["notes"]
+        self.assertIn("inside a VM", notes["power"])
+        self.assertIn("inside a VM", notes["temp"])
+        self.assertIn("memory", notes)
         backend._scanner = mock.Mock(memory_bytes={})
         for _ in range(2):
             block = backend.sample()[device.uid]
@@ -801,6 +814,17 @@ class TestIntelSensors(unittest.TestCase):
         _write(os.path.join(zone, "temp"), 61000)
         backend, device = self._backend()
         self.assertEqual(backend.sample()[device.uid]["temperature"]["celsius"], 61.0)
+
+    def test_bare_metal_missing_sources_explain_without_blaming_a_vm(self):
+        backend, device = self._backend()
+        self.assertNotIn("VM", device.sensors["notes"]["power"])
+        self.assertIn("coretemp", device.sensors["notes"]["temp"])
+
+    def test_sources_present_means_no_notes(self):
+        self._bare_metal()
+        backend, device = self._backend()
+        self.assertNotIn("power", device.sensors["notes"])
+        self.assertNotIn("temp", device.sensors["notes"])
 
     def test_discrete_arc_does_not_get_host_sensors(self):
         self._bare_metal()

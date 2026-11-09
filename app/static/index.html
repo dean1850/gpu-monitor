@@ -1116,10 +1116,24 @@ const TILES_EXTRA = {
 function tilesFor(device) {
   const sensors = device.sensors || {};
   const temps = Array.isArray(sensors.temperatures) ? sensors.temperatures : [];
+  const notes = sensors.notes || {};
   return TILES_BASE
     .concat(temps.length ? temps.map(tempTile) : [TILE_TEMP])
     .concat(sensors.fan ? [TILE_FAN] : [])
-    .concat(TILES_EXTRA[device.vendor] || []);
+    .concat(TILES_EXTRA[device.vendor] || [])
+    .map((tile) => notes[tile.key] ? withNote(tile, notes[tile.key]) : tile);
+}
+
+/* A tile the backend knows it can't fill (e.g. Intel iGPU power inside a
+   VM) still reads "—", but hovering it says why instead of nothing. */
+function withNote(tile, note) {
+  return Object.assign({}, tile, {
+    hint: (g) => {
+      let text = null;
+      try { text = tile.text(g); } catch (e) { text = null; }
+      return text === null ? note : (tile.hint ? tile.hint(g) : '');
+    }
+  });
 }
 
 function formatMemory(memory) {

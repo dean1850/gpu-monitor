@@ -100,6 +100,30 @@ POWERCAP_DIR = "/sys/class/powercap"
 HWMON_CLASS_DIR = "/sys/class/hwmon"
 THERMAL_CLASS_DIR = "/sys/class/thermal"
 MEMINFO_PATH = "/proc/meminfo"
+CPUINFO_PATH = "/proc/cpuinfo"
+
+# Tooltips for a tile that stays "—", so the reason is on the dashboard and
+# not only in the logs.
+_NOTE_VM_POWER = (
+    "Not available inside a VM: the hypervisor does not expose the CPU's "
+    "RAPL GPU-plane energy counter to guests."
+)
+_NOTE_VM_TEMP = (
+    "Not available inside a VM: the hypervisor does not expose the CPU "
+    "package temperature sensor to guests (an iGPU has no sensor of its own)."
+)
+_NOTE_HOST_POWER = (
+    "No RAPL GPU-plane counter found (perf power/energy-gpu or powercap "
+    "'uncore'). Older or server CPUs may not have one."
+)
+_NOTE_HOST_TEMP = (
+    "No CPU package sensor found. An iGPU has no sensor of its own; load the "
+    "coretemp module on the host to get the package temperature."
+)
+_NOTE_MEMORY = (
+    "Appears once a process opens the GPU. Needs kernel 6.8+ and "
+    "GPU_CONTAINER_ATTRIBUTION left on."
+)
 
 # PCI device-ID high bytes of Intel DISCRETE GPUs (DG1, Alchemist, Battlemage,
 # Ponte Vecchio).  Everything else is integrated, and gets the host-level
@@ -342,7 +366,14 @@ class IntelBackend(GpuBackend):
                 "temperatures": [
                     {"key": key, "label": label} for key, label, _ in device.extra["temps"]
                 ],
+                "notes": {},
             }
+            if device.extra.get("integrated"):
+                in_vm = running_in_vm()
+                device.extra["in_vm"] = in_vm
+                device.sensors["notes"]["memory"] = _NOTE_MEMORY
+                if not device.extra["temps"]:
+                    device.sensors["notes"]["temp"] = _NOTE_VM_TEMP if in_vm else _NOTE_HOST_TEMP
             device.sources = {
                 "pmu": device.extra.get("pmu_dir"),
                 "freq_actual": device.extra.get("freq_actual"),
@@ -423,7 +454,11 @@ class IntelBackend(GpuBackend):
             self._open_energy_source(device)
             temps = ",".join(label for _, label, _ in device.extra.get("temps") or []) or "none"
             if device.extra.get("integrated") and temps == "none":
-                temps += " (no CPU package sensor — normal inside a VM)"
+                temps += (
+                    " (running in a VM — the hypervisor does not expose the CPU "
+                    "package sensor)" if device.extra.get("in_vm")
+                    else " (no CPU package sensor found — is coretemp loaded?)"
+                )
             logger.info("intel: %s temperature sensors: %s.", device.name, temps)
 
         self._mem_total_bytes = read_meminfo_total()
@@ -458,10 +493,15 @@ class IntelBackend(GpuBackend):
         if source is not None:
             logger.info("intel: %s power via %s (%s).", device.name, source["label"], source["path"])
         elif device.extra.get("use_rapl"):
+            in_vm = device.extra.get("in_vm")
+            device.sensors.setdefault("notes", {})["power"] = (
+                _NOTE_VM_POWER if in_vm else _NOTE_HOST_POWER
+            )
             logger.info(
-                "intel: %s has no readable GPU power source (%s). RAPL is "
-                "normally not exposed inside a VM.",
+                "intel: %s has no readable GPU power source (%s)%s",
                 device.name, "; ".join(reasons) or "none found",
+                " — running in a VM, where the hypervisor does not expose RAPL."
+                if in_vm else ".",
             )
 
     def _rebuild_scanner(self) -> None:
@@ -911,6 +951,18 @@ def read_energy_raw(source: dict) -> int | None:
         except OSError:
             return None
     return read_int_file(source.get("path"))
+
+
+def running_in_vm(path: str | None = None) -> bool:
+    """True when the CPU reports the ``hypervisor`` flag, i.e. we are a guest."""
+    try:
+        with open(path or CPUINFO_PATH, "r") as f:
+            for line in f:
+                if line.startswith("flags"):
+                    return "hypervisor" in line.split()
+    except OSError:
+        return False
+    return False
 
 
 def read_meminfo_total(path: str | None = None) -> int | None:

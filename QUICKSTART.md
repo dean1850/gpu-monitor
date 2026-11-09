@@ -248,8 +248,8 @@ when the capability is granted. Confirm with
 `curl -s localhost:8088/health | grep error`.
 
 **Intel iGPU shows `—` for Power, Temp or Memory.**
-The startup log says which source each one resolved to (`docker logs
-gpu-monitor | grep intel:`). Power needs the RAPL GPU plane and temperature
+Hover the tile: it says why it's empty. The startup log says which source
+each one resolved to (`docker logs gpu-monitor | grep intel:`). Power needs the RAPL GPU plane and temperature
 the CPU package sensor; check on the Docker host with
 `ls /sys/devices/power/events/ /sys/class/powercap/` and
 `cat /sys/class/hwmon/*/name`. Neither exists inside a VM, so a Proxmox guest
