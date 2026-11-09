@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import glob
 import logging
 import os
 import platform
@@ -67,6 +68,56 @@ FDINFO_ENGINE_MAP: dict[str, str] = {
     "video-enhance": "video_enhance",
 }
 ENGINE_KEYS: tuple[str, ...] = ("render", "blitter", "video", "video_enhance")
+
+# ── power / temperature / memory sources ─────────────────────────────────
+#
+# FIX-INTEL-SENSORS-1: i915 itself exposes no power, temperature or memory
+# figure for an INTEGRATED GPU — but the hardware still has them:
+#
+#   Power        The CPU's RAPL "GPU plane" (PP1) energy counter IS the iGPU's
+#                energy.  It is read through the perf ``power`` PMU
+#                (``power/energy-gpu``, the same counter intel_gpu_top shows
+#                as "GPU W"), which needs only the CAP_PERFMON this container
+#                already holds for the engine counters.  powercap's
+#                ``intel-rapl:0:N`` "uncore" zone is the fallback.
+#   Temperature  An iGPU shares the CPU die and has no sensor of its own; the
+#                CPU package sensor (coretemp "Package id 0" /
+#                x86_pkg_temp) is the closest real reading, and is labelled
+#                "CPU pkg" so nobody mistakes it for a GPU-only sensor.
+#   Memory       There is no VRAM.  Kernels 6.8+ report every DRM client's
+#                buffer memory in fdinfo (``drm-resident-system0``); the sum
+#                across clients is the RAM the iGPU is actually holding,
+#                shown against system RAM because that is the pool it uses.
+#
+# Discrete Intel cards (Arc on i915 6.2+, or xe) export energy and
+# temperature through their OWN hwmon, which always wins when present.
+#
+# Inside a VM, RAPL and the package thermal sensor are normally not
+# virtualised, so those tiles still read "—" there.  That is correct.
+
+POWER_PMU_DIR = "/sys/devices/power"
+POWERCAP_DIR = "/sys/class/powercap"
+HWMON_CLASS_DIR = "/sys/class/hwmon"
+THERMAL_CLASS_DIR = "/sys/class/thermal"
+MEMINFO_PATH = "/proc/meminfo"
+
+# PCI device-ID high bytes of Intel DISCRETE GPUs (DG1, Alchemist, Battlemage,
+# Ponte Vecchio).  Everything else is integrated, and gets the host-level
+# RAPL and CPU-package fallbacks.
+_DISCRETE_ID_PREFIXES: frozenset[int] = frozenset({0x49, 0x4F, 0x56, 0xE2, 0x0B})
+
+# Discrete-card hwmon temperature labels (xe: pkg / vram / mctrl / pcie).
+_HWMON_TEMP_LABELS: dict[str, str] = {
+    "pkg": "GPU pkg",
+    "vram": "VRAM",
+    "mctrl": "Mem ctrl",
+    "pcie": "PCIe",
+}
+CPU_PKG_SENSOR = {"key": "cpu_pkg", "label": "CPU pkg"}
+
+# A reading this far above a desktop part's envelope is a counter glitch
+# (reset, wrap mis-detection), not a measurement.
+_MAX_PLAUSIBLE_WATTS = 2000.0
 
 PERF_FORMAT_TOTAL_TIME_ENABLED = 1 << 0
 PERF_FORMAT_TOTAL_TIME_RUNNING = 1 << 1
@@ -187,6 +238,9 @@ class IntelBackend(GpuBackend):
         # attribution state: uid -> {(pid, client): {engine: ns}}
         self._prev_clients: dict[str, dict[tuple[int, str], dict[str, int]]] = {}
         self._prev_attrib_wall: float | None = None
+        self._energy_prev: dict[str, tuple[int, float]] = {}
+        self._mem_seen: set[str] = set()
+        self._mem_total_bytes: int | None = None
 
     # ── discovery ────────────────────────────────────────────────────────
 
@@ -249,10 +303,55 @@ class IntelBackend(GpuBackend):
                 (f"{card['card_path']}/power/rc6_residency_ms",)
             )
             device.extra["fds"] = {}
+            device.extra["energy"] = None   # resolved in start()
+            device.extra.update(_find_device_hwmon(os.path.join(card["card_path"], "device")))
+            device.extra["integrated"] = (
+                (card["device_id"] >> 8) not in _DISCRETE_ID_PREFIXES
+                and device.extra["hwmon_energy"] is None
+            )
             devices.append(device)
 
+        self._assign_host_sensors(devices)
         self._devices = devices
         return devices
+
+    @staticmethod
+    def _assign_host_sensors(devices: list[GpuDevice]) -> None:
+        """
+        FIX-INTEL-SENSORS-2: give the integrated GPU the host-level sources
+        (RAPL GPU plane, CPU package temperature, shared-RAM total).  A host
+        has at most one iGPU, and those sources describe *it* — never a
+        discrete card sitting alongside — so only the first integrated
+        device gets them.
+        """
+        integrated = [d for d in devices if d.extra.get("integrated")]
+        for device in devices:
+            device.extra["use_rapl"] = False
+        if integrated:
+            igpu = integrated[0]
+            igpu.extra["use_rapl"] = True
+            if not igpu.extra["temps"]:
+                pkg = find_cpu_package_temp()
+                if pkg is not None:
+                    igpu.extra["temps"] = [
+                        (CPU_PKG_SENSOR["key"], CPU_PKG_SENSOR["label"], pkg)
+                    ]
+
+        for device in devices:
+            device.sensors = {
+                "temperatures": [
+                    {"key": key, "label": label} for key, label, _ in device.extra["temps"]
+                ],
+            }
+            device.sources = {
+                "pmu": device.extra.get("pmu_dir"),
+                "freq_actual": device.extra.get("freq_actual"),
+                "rc6": device.extra.get("rc6"),
+                "hwmon_energy": device.extra.get("hwmon_energy"),
+                "power_cap": device.extra.get("power_cap"),
+                "temps": {key: path for key, _, path in device.extra["temps"]},
+                "integrated": device.extra.get("integrated"),
+            }
 
     @staticmethod
     def _find_pmu_dir(pci_address: str | None) -> str | None:
@@ -320,7 +419,50 @@ class IntelBackend(GpuBackend):
         if failures and opened_any:
             logger.warning("intel: some devices degraded: %s", "; ".join(failures))
 
+        for device in self._devices:
+            self._open_energy_source(device)
+            temps = ",".join(label for _, label, _ in device.extra.get("temps") or []) or "none"
+            if device.extra.get("integrated") and temps == "none":
+                temps += " (no CPU package sensor — normal inside a VM)"
+            logger.info("intel: %s temperature sensors: %s.", device.name, temps)
+
+        self._mem_total_bytes = read_meminfo_total()
         self._rebuild_scanner()
+
+    def _open_energy_source(self, device: GpuDevice) -> None:
+        """Pick this device's power source.  Never raises."""
+        device.extra["energy"] = None
+        source: dict | None = None
+        reasons: list[str] = []
+
+        if device.extra.get("hwmon_energy"):
+            source = {
+                "kind": "hwmon",
+                "label": "GPU hwmon energy counter",
+                "path": device.extra["hwmon_energy"],
+                "unit_j": 1e-6,
+                "wrap": None,
+            }
+        elif device.extra.get("use_rapl"):
+            try:
+                source = open_rapl_perf_energy()
+            except Exception as exc:  # noqa: BLE001
+                reasons.append(f"perf power/energy-gpu: {exc}")
+            if source is None:
+                source, why = find_rapl_powercap_energy()
+                if why:
+                    reasons.append(f"powercap: {why}")
+
+        device.extra["energy"] = source
+        device.sources["power"] = source["path"] if source else None
+        if source is not None:
+            logger.info("intel: %s power via %s (%s).", device.name, source["label"], source["path"])
+        elif device.extra.get("use_rapl"):
+            logger.info(
+                "intel: %s has no readable GPU power source (%s). RAPL is "
+                "normally not exposed inside a VM.",
+                device.name, "; ".join(reasons) or "none found",
+            )
 
     def _rebuild_scanner(self) -> None:
         node_map = {
@@ -396,6 +538,13 @@ class IntelBackend(GpuBackend):
                 except OSError:
                     pass
             device.extra["fds"] = {}
+            energy = device.extra.get("energy")
+            if energy and energy.get("fd") is not None:
+                try:
+                    os.close(energy["fd"])
+                except OSError:
+                    pass
+            device.extra["energy"] = None
 
     # ── sampling ─────────────────────────────────────────────────────────
 
@@ -429,7 +578,89 @@ class IntelBackend(GpuBackend):
         if rc6:
             block["rc6"] = rc6
 
+        power = self._read_power(device)
+        if power:
+            block["power"] = power
+
+        temperature = self._read_temperature(device)
+        if temperature:
+            block["temperature"] = temperature
+
+        memory = self._read_memory(device)
+        if memory:
+            block["memory"] = memory
+
         return block
+
+    def _read_power(self, device: GpuDevice) -> dict:
+        source = device.extra.get("energy")
+        if not source:
+            return {}
+        raw = read_energy_raw(source)
+        if raw is None:
+            return {}
+
+        now = time.monotonic()
+        prev = self._energy_prev.get(device.uid)
+        self._energy_prev[device.uid] = (raw, now)
+        if prev is None:
+            return {}  # first tick: baseline only
+
+        prev_raw, prev_wall = prev
+        delta = raw - prev_raw
+        if delta < 0:
+            if not source.get("wrap"):
+                return {}  # counter reset — skip this tick
+            delta += source["wrap"]
+        delta_s = now - prev_wall
+        if delta_s <= 0:
+            return {}
+
+        watts = delta * source["unit_j"] / delta_s
+        if not 0.0 <= watts <= _MAX_PLAUSIBLE_WATTS:
+            return {}
+
+        out: dict = {"watts": round(watts, 2), "source": source["label"]}
+        cap_uw = read_int_file(device.extra.get("power_cap"))
+        if cap_uw:
+            out["cap_watts"] = round(cap_uw / 1e6, 1)
+        return out
+
+    @staticmethod
+    def _read_temperature(device: GpuDevice) -> dict:
+        channels: dict[str, float] = {}
+        for key, _label, path in device.extra.get("temps") or []:
+            milli = read_int_file(path)
+            if milli is not None:
+                channels[key] = round(milli / 1000.0, 1)
+        if not channels:
+            return {}
+        primary = next(key for key, _, _ in device.extra["temps"] if key in channels)
+        return {"celsius": channels[primary], "sensor": primary, "channels": channels}
+
+    def _read_memory(self, device: GpuDevice) -> dict:
+        """
+        Shared-RAM buffers held by this iGPU's DRM clients, from this tick's
+        fdinfo pass (attribution runs before sample).  Absent until a kernel
+        that prints fdinfo memory stats has been seen, so an older kernel
+        shows "—" rather than a fake 0.
+        """
+        if not device.extra.get("integrated") or self._scanner is None:
+            return {}
+        used = self._scanner.memory_bytes.get(device.uid)
+        if used is not None:
+            self._mem_seen.add(device.uid)
+        elif device.uid in self._mem_seen:
+            used = 0  # stats supported, no client holds memory right now
+        else:
+            return {}
+
+        out: dict = {"used_mib": round(used / (1024 * 1024), 1), "shared": True}
+        total = self._mem_total_bytes
+        if total:
+            out["total_mib"] = round(total / (1024 * 1024), 1)
+            out["used_pct"] = round(min(100.0, used / total * 100.0), 2)
+        return out
 
     def _read_engine_busy(self, device: GpuDevice) -> dict[str, dict[str, float]]:
         fds: dict[str, int] = device.extra.get("fds") or {}
@@ -543,6 +774,155 @@ class IntelBackend(GpuBackend):
             prev_clients=self._prev_clients,
             prev_wall_holder=self,
         )
+
+
+# ── sensor discovery helpers ─────────────────────────────────────────────
+
+
+def _read_word(path: str) -> str | None:
+    try:
+        return read_text(path).strip() or None
+    except OSError:
+        return None
+
+
+def _find_device_hwmon(device_dir: str) -> dict:
+    """
+    Energy, power limit and temperatures a DISCRETE Intel card exports
+    through its own hwmon (i915 on DG1/DG2 from kernel 6.2, and xe).  An
+    integrated GPU has none of these files, so everything comes back empty.
+    Resolved by existence only — no trial reads.
+    """
+    out: dict = {"hwmon_energy": None, "power_cap": None, "temps": []}
+    seen: set[str] = set()
+    for hwmon_dir in sorted(glob.glob(os.path.join(device_dir, "hwmon", "hwmon*"))):
+        def p(name: str, _d: str = hwmon_dir) -> str | None:
+            return first_existing((os.path.join(_d, name),))
+
+        out["hwmon_energy"] = out["hwmon_energy"] or p("energy1_input")
+        out["power_cap"] = out["power_cap"] or p("power1_max")
+        for channel in range(1, 10):
+            path = p(f"temp{channel}_input")
+            if path is None:
+                continue
+            key = _read_word(os.path.join(hwmon_dir, f"temp{channel}_label"))
+            key = (key or f"temp{channel}").lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out["temps"].append((key, _HWMON_TEMP_LABELS.get(key, key.title()), path))
+    return out
+
+
+def find_cpu_package_temp() -> str | None:
+    """
+    The CPU package temperature input, which on an iGPU host is the die the
+    GPU lives on.  coretemp's "Package id 0" first, then the x86_pkg_temp
+    thermal zone.  Neither exists in a typical VM.
+    """
+    for hwmon_dir in sorted(glob.glob(os.path.join(HWMON_CLASS_DIR, "hwmon*"))):
+        if _read_word(os.path.join(hwmon_dir, "name")) != "coretemp":
+            continue
+        for channel in range(1, 64):
+            label = _read_word(os.path.join(hwmon_dir, f"temp{channel}_label"))
+            if label is None:
+                continue
+            if label.lower().startswith("package id"):
+                path = os.path.join(hwmon_dir, f"temp{channel}_input")
+                if os.path.exists(path):
+                    return path
+
+    for zone in sorted(glob.glob(os.path.join(THERMAL_CLASS_DIR, "thermal_zone*"))):
+        if _read_word(os.path.join(zone, "type")) == "x86_pkg_temp":
+            path = os.path.join(zone, "temp")
+            if os.path.exists(path):
+                return path
+    return None
+
+
+def open_rapl_perf_energy(pmu_dir: str | None = None) -> dict | None:
+    """
+    Open the RAPL GPU-plane counter (``power/energy-gpu``) as a perf event.
+    Returns None when this CPU/kernel has no such event; raises OSError if
+    it exists but cannot be opened.
+    """
+    pmu_dir = pmu_dir or POWER_PMU_DIR
+    event_path = os.path.join(pmu_dir, "events", "energy-gpu")
+    if not os.path.exists(event_path):
+        return None
+
+    pmu_type = int(read_text(os.path.join(pmu_dir, "type")).strip())
+    cpu = _first_int(read_text(os.path.join(pmu_dir, "cpumask")))
+    config, config1 = IntelBackend._derive_pmu_config(pmu_dir, "energy-gpu")
+    try:
+        scale = float(read_text(event_path + ".scale").strip())
+    except (OSError, ValueError):
+        scale = 2.3283064365386962890625e-10  # 1/2^32 J, the RAPL default
+
+    attr = _PerfEventAttr()
+    attr.type = pmu_type
+    attr.size = 128
+    attr.config = config
+    attr.config1 = config1
+    attr.read_format = PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING
+    fd = _perf_event_open(attr, pid=-1, cpu=cpu, group_fd=-1, flags=PERF_FLAG_FD_CLOEXEC)
+    return {
+        "kind": "rapl_perf",
+        "label": "RAPL GPU plane (PP1)",
+        "path": event_path,
+        "fd": fd,
+        "unit_j": scale,
+        "wrap": None,
+    }
+
+
+def find_rapl_powercap_energy(powercap_dir: str | None = None) -> tuple[dict | None, str | None]:
+    """
+    powercap fallback: the ``intel-rapl:<pkg>:<n>`` subzone named "uncore"
+    is the GPU plane on client CPUs.  Returns (source, reason-if-none).
+    ``energy_uj`` is root-only since the PLATYPUS mitigation, hence the
+    trial read here.
+    """
+    for zone in sorted(glob.glob(os.path.join(powercap_dir or POWERCAP_DIR, "intel-rapl:*:*"))):
+        if _read_word(os.path.join(zone, "name")) != "uncore":
+            continue
+        path = os.path.join(zone, "energy_uj")
+        try:
+            int(read_text(path).strip())
+        except (OSError, ValueError) as exc:
+            return None, f"{path} unreadable ({exc})"
+        max_range = read_int_file(os.path.join(zone, "max_energy_range_uj"))
+        return {
+            "kind": "rapl_powercap",
+            "label": "RAPL GPU plane (PP1)",
+            "path": path,
+            "fd": None,
+            "unit_j": 1e-6,
+            "wrap": (max_range + 1) if max_range else None,
+        }, None
+    return None, "no intel-rapl 'uncore' zone"
+
+
+def read_energy_raw(source: dict) -> int | None:
+    """Cumulative raw count of an energy source; None on any failure."""
+    if source.get("fd") is not None:
+        try:
+            return _read_perf_counter(source["fd"])[0]
+        except OSError:
+            return None
+    return read_int_file(source.get("path"))
+
+
+def read_meminfo_total(path: str | None = None) -> int | None:
+    """System RAM in bytes (``MemTotal``) — the pool an iGPU allocates from."""
+    try:
+        with open(path or MEMINFO_PATH, "r") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
 
 
 # ── shared attribution maths (used by Intel and AMD) ─────────────────────

@@ -62,9 +62,10 @@ function walk(rand, { start, min, max, step }) {
 
 /* ── synthetic hosts ──────────────────────────────────────────────────────
    Each entry mirrors exactly what its backend can actually report. The Intel
-   iGPU has no VRAM, no power sensor and no temperature sensor exposed through
-   i915, so those keys are absent — the dashboard must render "—" for them,
-   and the screenshot has to show that rather than a fabricated zero. */
+   iGPU is a bare-metal host: power is the RAPL GPU plane, temperature is the
+   CPU package sensor (the iGPU's die — labelled "CPU pkg"), and memory is
+   the shared RAM its DRM clients hold out of system RAM. Inside a VM those
+   keys are absent and the dashboard renders "—" for them instead. */
 const HOSTS = {
   intel: {
     uid: 'intel:0000:00:02.0',
@@ -82,6 +83,11 @@ const HOSTS = {
     ],
     frequency: { max: 1150, walk: { start: 833, min: 350, max: 1150, step: 90 } },
     rc6: { start: 14, min: 4, max: 46, step: 7 },
+    memory: { total: 15872, shared: true, walk: { start: 410, min: 280, max: 720, step: 40 } },
+    power: { start: 4.2, min: 1.1, max: 9.5, step: 0.8 },
+    powerSource: 'RAPL GPU plane (PP1)',
+    temp: { start: 52, min: 44, max: 63, step: 1.2 },
+    sensors: { temperatures: [{ key: 'cpu_pkg', label: 'CPU pkg' }] },
     containers: {
       jellyfin: 0.86,
       frigate: 0.09,
@@ -221,16 +227,22 @@ function synthesise(names) {
           used_pct: Math.round((s.mem[t] / host.memory.total) * 1000) / 10
         };
         if (s.membus) block.memory.busy_pct = s.membus[t];
+        if (host.memory.shared) block.memory.shared = true;
       }
       if (s.power) {
         block.power = { watts: s.power[t] };
         if (host.powerCap) block.power.cap_watts = host.powerCap;
+        if (host.powerSource) block.power.source = host.powerSource;
       }
       if (s.temp) block.temperature = { celsius: s.temp[t] };
       if (s.temp && s.hotspot) {
         block.temperature.sensor = 'edge';
         block.temperature.channels = { edge: s.temp[t], junction: s.hotspot[t] };
         if (s.memtemp) block.temperature.channels.mem = s.memtemp[t];
+      } else if (s.temp && host.sensors && host.sensors.temperatures) {
+        const key = host.sensors.temperatures[0].key;
+        block.temperature.sensor = key;
+        block.temperature.channels = { [key]: s.temp[t] };
       }
       if (s.fan) block.fan = { rpm: s.fan[t] };
 

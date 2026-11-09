@@ -364,6 +364,11 @@ class FdinfoScanner:
         for node, uid in node_to_uid.items():
             self._node_to_uid[os.path.basename(node)] = uid
         self._noid_logged: set[int] = set()
+        # FIX-INTEL-SENSORS-3: {device_uid: bytes} of buffer memory held by
+        # DRM clients, from the last scan.  A uid is present only if at least
+        # one of its clients printed drm-resident-*/drm-total-* lines (kernel
+        # 6.8+ for i915), so an older kernel reads as "unknown", not 0.
+        self.memory_bytes: dict[str, int] = {}
 
     @property
     def node_basenames(self) -> tuple[str, ...]:
@@ -400,6 +405,10 @@ class FdinfoScanner:
             return None
 
         result: dict[str, dict[tuple[int, str], dict[str, int]]] = {}
+        # uid -> client key -> bytes.  Identified clients are keyed on the
+        # client id alone: a fd inherited across fork() is ONE client in two
+        # PIDs, and its buffers exist once.
+        memory: dict[str, dict[object, int]] = {}
 
         for entry in pid_entries:
             if not entry.isdigit():
@@ -436,16 +445,20 @@ class FdinfoScanner:
                 except OSError:
                     continue
 
-                client_id, engines = _parse_fdinfo(info_text)
+                client_id, engines, mem_bytes = parse_fdinfo_full(info_text)
                 if not engines:
                     # A DRM fd with no engine counters tells us nothing.
                     continue
 
                 if client_id is not None:
                     identified.setdefault(uid, {})[client_id] = engines
+                    if mem_bytes is not None:
+                        memory.setdefault(uid, {})[("id", client_id)] = mem_bytes
                 else:
                     frozen = tuple(sorted(engines.items()))
                     anonymous.setdefault(uid, set()).add(frozen)
+                    if mem_bytes is not None:
+                        memory.setdefault(uid, {})[("noid", pid, frozen)] = mem_bytes
                     if pid not in self._noid_logged:
                         logger.info(
                             "drm: PID %d has a DRM fd with no drm-client-id — "
@@ -469,11 +482,29 @@ class FdinfoScanner:
                 if merged:
                     result.setdefault(uid, {})[(pid, "noid")] = merged
 
+        self.memory_bytes = {uid: sum(clients.values()) for uid, clients in memory.items()}
         return result
 
     def _uid_for_target(self, target: str) -> str | None:
         base = os.path.basename(target)
         return self._node_to_uid.get(base)
+
+
+_MEM_UNITS: dict[str, int] = {"": 1, "B": 1, "KIB": 1024, "MIB": 1024 ** 2, "GIB": 1024 ** 3}
+
+
+def parse_mem_value(text: str) -> int | None:
+    """Parse a DRM fdinfo memory value (``"2048 KiB"``, ``"4 MiB"``, ``"512"``) to bytes."""
+    parts = text.split()
+    if not parts:
+        return None
+    try:
+        value = int(parts[0])
+    except ValueError:
+        return None
+    unit = parts[1].upper() if len(parts) > 1 else ""
+    mult = _MEM_UNITS.get(unit)
+    return None if mult is None else value * mult
 
 
 def _parse_fdinfo(info_text: str) -> tuple[str | None, dict[str, int]]:
@@ -484,12 +515,33 @@ def _parse_fdinfo(info_text: str) -> tuple[str | None, dict[str, int]]:
     ``video`` for i915; ``gfx``, ``compute``, ``dec``, ``enc`` for amdgpu) —
     each backend maps them onto its own display keys.
     """
+    client_id, engines, _mem = parse_fdinfo_full(info_text)
+    return client_id, engines
+
+
+def parse_fdinfo_full(info_text: str) -> tuple[str | None, dict[str, int], int | None]:
+    """
+    ``_parse_fdinfo`` plus the client's buffer memory in bytes.
+
+    Memory is the sum over regions of ``drm-resident-<region>`` (what is
+    actually backed by pages), falling back to ``drm-total-<region>`` for a
+    region with no resident line.  None when the kernel printed neither —
+    i.e. memory stats are unsupported, which is different from 0.
+    """
     client_id: str | None = None
     engines: dict[str, int] = {}
+    resident: dict[str, int] = {}
+    total: dict[str, int] = {}
 
     for line in info_text.splitlines():
         if line.startswith("drm-client-id:"):
             client_id = line.split(":", 1)[1].strip()
+        elif line.startswith(("drm-resident-", "drm-total-")):
+            key, _, value = line.partition(":")
+            kind, _, region = key.strip()[len("drm-"):].partition("-")
+            nbytes = parse_mem_value(value.strip())
+            if nbytes is not None and region:
+                (resident if kind == "resident" else total)[region] = nbytes
         elif line.startswith(_DRM_ENGINE_PREFIX):
             key, _, value = line.partition(":")
             raw_name = key[len(_DRM_ENGINE_PREFIX):].strip()
@@ -500,4 +552,6 @@ def _parse_fdinfo(info_text: str) -> tuple[str | None, dict[str, int]]:
                 # "enc"), so a repeated key is more work, not a correction.
                 engines[raw_name] = engines.get(raw_name, 0) + ns
 
-    return client_id, engines
+    regions = set(resident) | set(total)
+    memory = sum(resident.get(r, total.get(r, 0)) for r in regions) if regions else None
+    return client_id, engines, memory

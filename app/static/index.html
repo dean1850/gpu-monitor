@@ -1002,8 +1002,11 @@ function pushPoint(chart, seriesIndex, value) {
    old secondary chart honest, and the same rule applies here.
 
    A metric this host cannot report renders "—" with a flat, empty trace.
-   Never a plausible-looking zero: an Intel iGPU genuinely has no VRAM, no
-   power sensor and no temperature sensor exposed through i915.
+   Never a plausible-looking zero. An Intel iGPU has no VRAM and no sensors
+   of its own in i915: its Power comes from the CPU's RAPL GPU plane, its
+   temperature is the CPU package sensor (labelled "CPU pkg"), and Memory is
+   the shared RAM its DRM clients hold — each "—" where the host (e.g. a VM)
+   doesn't expose it.
    ═══════════════════════════════════════════════════════════════════════ */
 const freqPct = (g) =>
   (g.frequency && g.frequency.actual !== undefined && g.frequency.max)
@@ -1032,7 +1035,9 @@ const TILES_BASE = [
   {
     key: 'memory', label: 'Memory MiB', mode: 'pct',
     text: (g) => formatMemory(g.memory),
-    spark: (g) => g.memory ? g.memory.used_pct : undefined
+    spark: (g) => g.memory ? g.memory.used_pct : undefined,
+    hint: (g) => (g.memory && g.memory.shared)
+      ? 'GPU buffers held in shared system RAM / total system RAM' : ''
   },
   {
     key: 'power', label: 'Power W', mode: 'auto',
@@ -1044,13 +1049,19 @@ const TILES_BASE = [
       return g.power.cap_watts ? `${w}/${Math.round(g.power.cap_watts)}` : w;
     },
     spark: (g) => g.power ? g.power.watts : undefined,
-    hint: (g) => (g.power && g.power.cap_watts)
-      ? `board power limit ${g.power.cap_watts} W` : ''
+    hint: (g) => {
+      if (!g.power) return '';
+      const parts = [];
+      if (g.power.cap_watts) parts.push(`board power limit ${g.power.cap_watts} W`);
+      if (g.power.source) parts.push(g.power.source);
+      return parts.join(' · ');
+    }
   }
 ];
 
 /* Generic temperature tile, for GPUs whose backend reports one reading
-   without a per-sensor inventory (NVIDIA; Intel shows it as "—"). */
+   without a per-sensor inventory (NVIDIA; an Intel iGPU with no CPU
+   package sensor visible shows it as "—"). */
 const TILE_TEMP = {
   key: 'temp', label: 'Temp °C', mode: 'auto',
   text: (g) => g.temperature ? `${g.temperature.celsius.toFixed(0)}` : null,

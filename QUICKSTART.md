@@ -247,6 +247,16 @@ are both required — Docker's default seccomp profile blocks that syscall even
 when the capability is granted. Confirm with
 `curl -s localhost:8088/health | grep error`.
 
+**Intel iGPU shows `—` for Power, Temp or Memory.**
+The startup log says which source each one resolved to (`docker logs
+gpu-monitor | grep intel:`). Power needs the RAPL GPU plane and temperature
+the CPU package sensor; check on the Docker host with
+`ls /sys/devices/power/events/ /sys/class/powercap/` and
+`cat /sys/class/hwmon/*/name`. Neither exists inside a VM, so a Proxmox guest
+with the iGPU passed through will keep showing `—` for those two. Memory
+needs kernel 6.8+ (`uname -r`) and `GPU_CONTAINER_ATTRIBUTION` left on, and
+appears once something has opened the GPU.
+
 **A container that uses the GPU isn't listed.**
 Check `/health` → `container_resolver.gpu_containers_by_access`. If it isn't
 under `drm`, that container's GPU access isn't being detected — confirm it has

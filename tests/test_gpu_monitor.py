@@ -15,6 +15,8 @@ so the whole suite runs on a machine with no GPU at all:
   7. Backend contract — probe() never raises with no hardware present
   8. AMD sysfs/hwmon — deep-sleep clock, every temperature sensor, fan,
      power fallbacks, runtime-suspend, idle engine zeros (RX 7400 layout)
+  9. Intel iGPU sensors — RAPL GPU-plane power, CPU package temperature,
+     fdinfo shared-memory totals, and "—" (absent) inside a VM
 
 Run:  python3 tests/test_gpu_monitor.py
 """
@@ -670,6 +672,186 @@ class TestFdinfoParsing(unittest.TestCase):
                 drm.device_display_name(0x1002, 0xFFFF, "amdgpu"),
                 "AMD Radeon RX 9999 XT",
             )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 9. Intel iGPU power / temperature / memory
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _write(path: str, value) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(f"{value}\n")
+
+
+class TestIntelSensors(unittest.TestCase):
+    """UHD 630 (8086:3e92): no i915 hwmon, so host-level sources are used."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self._tmp.name
+        self.card_path = os.path.join(self.root, "drm", "card0")
+        os.makedirs(os.path.join(self.card_path, "device"))
+        self.hwmon = os.path.join(self.root, "hwmon")
+        self.thermal = os.path.join(self.root, "thermal")
+        self.powercap = os.path.join(self.root, "powercap")
+        self.meminfo = os.path.join(self.root, "meminfo")
+        for d in (self.hwmon, self.thermal, self.powercap):
+            os.makedirs(d)
+        with open(self.meminfo, "w") as f:
+            f.write("MemTotal:       16384000 kB\nMemFree: 1 kB\n")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _bare_metal(self):
+        coretemp = os.path.join(self.hwmon, "hwmon2")
+        _write(os.path.join(coretemp, "name"), "coretemp")
+        _write(os.path.join(coretemp, "temp1_label"), "Package id 0")
+        _write(os.path.join(coretemp, "temp1_input"), 54000)
+        _write(os.path.join(coretemp, "temp2_label"), "Core 0")
+        _write(os.path.join(coretemp, "temp2_input"), 50000)
+        zone = os.path.join(self.powercap, "intel-rapl:0:1")
+        _write(os.path.join(zone, "name"), "uncore")
+        _write(os.path.join(zone, "energy_uj"), 1_000_000)
+        _write(os.path.join(zone, "max_energy_range_uj"), 262143328850)
+        return zone
+
+    def _backend(self, device_id=0x3E92):
+        from backends import intel
+
+        card = {
+            "card": "card0", "card_path": self.card_path,
+            "vendor_id": 0x8086, "device_id": device_id, "vendor": "intel",
+            "driver": "i915", "pci_address": "0000:00:02.0",
+            "render_node": "/dev/dri/renderD128",
+        }
+        patches = [
+            mock.patch.object(intel, "enumerate_drm_cards", return_value=[card]),
+            mock.patch.object(intel, "HWMON_CLASS_DIR", self.hwmon),
+            mock.patch.object(intel, "THERMAL_CLASS_DIR", self.thermal),
+            mock.patch.object(intel, "POWERCAP_DIR", self.powercap),
+            mock.patch.object(intel, "MEMINFO_PATH", self.meminfo),
+            mock.patch.object(intel, "POWER_PMU_DIR", os.path.join(self.root, "nopmu")),
+            mock.patch.object(intel.IntelBackend, "_find_pmu_dir", return_value=None),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        backend = intel.IntelBackend()
+        devices = backend.probe()
+        backend.start()
+        self.addCleanup(backend.close)
+        return backend, devices[0]
+
+    def test_bare_metal_igpu_gets_power_temp_and_memory(self):
+        zone = self._bare_metal()
+        backend, device = self._backend()
+
+        self.assertTrue(device.extra["integrated"])
+        self.assertEqual(device.sensors["temperatures"], [{"key": "cpu_pkg", "label": "CPU pkg"}])
+
+        first = backend.sample()[device.uid]
+        self.assertNotIn("power", first)  # baseline tick
+        self.assertEqual(first["temperature"]["celsius"], 54.0)
+        self.assertEqual(first["temperature"]["sensor"], "cpu_pkg")
+
+        # Advance the RAPL counter by a known amount over a known interval.
+        prev_raw, prev_wall = backend._energy_prev[device.uid]
+        backend._energy_prev[device.uid] = (prev_raw, prev_wall - 2.0)
+        _write(os.path.join(zone, "energy_uj"), 1_000_000 + 7_000_000)
+        power = backend.sample()[device.uid]["power"]
+        self.assertAlmostEqual(power["watts"], 3.5, delta=0.1)
+        self.assertIn("RAPL", power["source"])
+
+        backend._scanner = mock.Mock(memory_bytes={device.uid: 512 * 1024 * 1024})
+        memory = backend.sample()[device.uid]["memory"]
+        self.assertEqual(memory["used_mib"], 512.0)
+        self.assertEqual(memory["total_mib"], 16000.0)
+        self.assertTrue(memory["shared"])
+
+        # Clients went away: a supported kernel now means a real 0.
+        backend._scanner = mock.Mock(memory_bytes={})
+        self.assertEqual(backend.sample()[device.uid]["memory"]["used_mib"], 0.0)
+
+    def test_powercap_wraparound(self):
+        zone = self._bare_metal()
+        backend, device = self._backend()
+        backend.sample()
+        prev_raw, prev_wall = backend._energy_prev[device.uid]
+        backend._energy_prev[device.uid] = (262143328850 - 1_000_000, prev_wall - 1.0)
+        _write(os.path.join(zone, "energy_uj"), 1_000_000)
+        power = backend.sample()[device.uid]["power"]
+        self.assertAlmostEqual(power["watts"], 2.0, delta=0.1)
+
+    def test_vm_without_rapl_or_coretemp_reports_nothing(self):
+        backend, device = self._backend()
+        backend._scanner = mock.Mock(memory_bytes={})
+        for _ in range(2):
+            block = backend.sample()[device.uid]
+        self.assertNotIn("power", block)
+        self.assertNotIn("temperature", block)
+        self.assertNotIn("memory", block)  # kernel never showed memory stats
+        self.assertEqual(device.sensors["temperatures"], [])
+
+    def test_x86_pkg_temp_thermal_zone_fallback(self):
+        zone = os.path.join(self.thermal, "thermal_zone3")
+        _write(os.path.join(zone, "type"), "x86_pkg_temp")
+        _write(os.path.join(zone, "temp"), 61000)
+        backend, device = self._backend()
+        self.assertEqual(backend.sample()[device.uid]["temperature"]["celsius"], 61.0)
+
+    def test_discrete_arc_does_not_get_host_sensors(self):
+        self._bare_metal()
+        backend, device = self._backend(device_id=0x56A0)
+        self.assertFalse(device.extra["integrated"])
+        self.assertIsNone(device.extra["energy"])
+        self.assertEqual(device.sensors["temperatures"], [])
+
+
+class TestFdinfoMemory(unittest.TestCase):
+    I915_68 = (
+        "drm-driver:\ti915\n"
+        "drm-client-id:\t42\n"
+        "drm-total-system0:\t2048 KiB\n"
+        "drm-shared-system0:\t0\n"
+        "drm-active-system0:\t0\n"
+        "drm-resident-system0:\t1024 KiB\n"
+        "drm-total-stolen-system0:\t4 MiB\n"
+        "drm-engine-render:\t100 ns\n"
+    )
+
+    def test_resident_preferred_total_as_fallback(self):
+        client, engines, mem = drm.parse_fdinfo_full(self.I915_68)
+        self.assertEqual(client, "42")
+        self.assertEqual(engines, {"render": 100})
+        # system0 resident 1 MiB + stolen-system0 total 4 MiB
+        self.assertEqual(mem, 1024 * 1024 + 4 * 1024 * 1024)
+
+    def test_old_kernel_reports_none_not_zero(self):
+        _client, _engines, mem = drm.parse_fdinfo_full(fdinfo("1", render=5))
+        self.assertIsNone(mem)
+
+    def test_scanner_sums_clients_and_dedups_forked_fd(self):
+        node = "/dev/dri/renderD128"
+        other = self.I915_68.replace("\t42", "\t43")
+        holder: dict = {}
+
+        def build(proc):
+            proc.add(100, [(node, self.I915_68), (node, other)])
+            proc.add(101, [(node, self.I915_68)])  # client 42 again, inherited
+
+        real_ctor = drm.FdinfoScanner
+
+        def capture(node_map):
+            holder["scanner"] = real_ctor(node_map)
+            return holder["scanner"]
+
+        with mock.patch.object(drm, "FdinfoScanner", capture):
+            TestFdinfoScanner._scan(None, build, {node: "intel:x"})
+        # Two distinct clients x 5 MiB each; the inherited fd is not re-counted.
+        self.assertEqual(holder["scanner"].memory_bytes, {"intel:x": 2 * 5 * 1024 * 1024})
 
 
 if __name__ == "__main__":
